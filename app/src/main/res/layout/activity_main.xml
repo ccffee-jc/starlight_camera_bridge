@@ -17,12 +17,6 @@
             android:textStyle="bold"
             android:textSize="18sp" />
 
-        <com.google.android.material.switchmaterial.SwitchMaterial
-            android:id="@+id/switchAdbRoot"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="@string/adb_root_enable" />
-
         <com.google.android.material.textfield.TextInputLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
@@ -134,21 +128,6 @@
             android:text="@string/frida_section_title"
             android:textStyle="bold"
             android:textSize="18sp" />
-
-        <com.google.android.material.textfield.TextInputLayout
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="8dp"
-            android:hint="@string/frida_avm_close_mode_label"
-            app:endIconMode="dropdown_menu">
-
-            <com.google.android.material.textfield.MaterialAutoCompleteTextView
-                android:id="@+id/inputAvmCloseMode"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:inputType="none" />
-
-        </com.google.android.material.textfield.TextInputLayout>
 
         <LinearLayout
             android:layout_width="match_parent"

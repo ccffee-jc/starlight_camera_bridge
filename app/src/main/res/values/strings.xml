@@ -10,7 +10,6 @@
     <string name="adb_execute">执行命令</string>
     <string name="adb_output_label">输出</string>
     <string name="adb_root_section">ADB 提权</string>
-    <string name="adb_root_enable">启用提权</string>
     <string name="adb_root_password_label">提权密码</string>
     <string name="adb_root_password_hint">输入提权密码</string>
     <string name="adb_root_password_save">保存密码</string>
@@ -28,10 +27,4 @@
     <string name="frida_btn_restore">恢复程序</string>
     <string name="frida_log_label">注入日志</string>
     <string name="frida_log_idle">等待操作…</string>
-    <string name="frida_avm_close_mode_label">360 激活后关闭策略</string>
-    <string name="frida_avm_close_mode_back">返回键（推荐）</string>
-    <string name="frida_avm_close_mode_home">Home 键</string>
-    <string name="frida_avm_close_mode_back_home">返回后 Home</string>
-    <string name="frida_avm_close_mode_none">不自动关闭</string>
-    <string name="frida_avm_close_mode_saved">360 关闭策略已保存</string>
 </resources>
