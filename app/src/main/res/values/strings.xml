@@ -1,0 +1,37 @@
+<resources>
+    <string name="app_name">Starlight Camera Bridge</string>
+    <string name="adb_section_title">ADB 执行</string>
+    <string name="adb_host_label">ADB Host</string>
+    <string name="adb_port_label">ADB Port</string>
+    <string name="adb_port_hint">例如 5557</string>
+    <string name="adb_save_connection">保存连接</string>
+    <string name="adb_connection_saved">连接参数已保存</string>
+    <string name="adb_command_label">注入命令</string>
+    <string name="adb_execute">执行命令</string>
+    <string name="adb_output_label">输出</string>
+    <string name="adb_root_section">ADB 提权</string>
+    <string name="adb_root_enable">启用提权</string>
+    <string name="adb_root_password_label">提权密码</string>
+    <string name="adb_root_password_hint">输入提权密码</string>
+    <string name="adb_root_password_save">保存密码</string>
+    <string name="adb_root_password_empty">请先设置提权密码</string>
+    <string name="adb_command_empty">请填写注入命令</string>
+    <string name="adb_host_empty">Host 不能为空</string>
+    <string name="adb_port_invalid">端口需在 1-65535 之间</string>
+    <string name="adb_command_running">命令执行中...</string>
+    <string name="adb_command_failed">命令执行失败</string>
+    <string name="adb_password_saved">提权密码已更新</string>
+
+    <!-- Frida 注入 -->
+    <string name="frida_section_title">Frida 注入</string>
+    <string name="frida_btn_inject">开始注入</string>
+    <string name="frida_btn_restore">恢复程序</string>
+    <string name="frida_log_label">注入日志</string>
+    <string name="frida_log_idle">等待操作…</string>
+    <string name="frida_avm_close_mode_label">360 激活后关闭策略</string>
+    <string name="frida_avm_close_mode_back">返回键（推荐）</string>
+    <string name="frida_avm_close_mode_home">Home 键</string>
+    <string name="frida_avm_close_mode_back_home">返回后 Home</string>
+    <string name="frida_avm_close_mode_none">不自动关闭</string>
+    <string name="frida_avm_close_mode_saved">360 关闭策略已保存</string>
+</resources>
