@@ -97,4 +97,77 @@ class FridaDeployerPolicyTest {
         assertTrue(observation.passwordRejected)
         assertTrue(observation.markerMissing)
     }
+
+    @Test
+    fun diagnoseTargetProcessMissing_detectsPermissionIssue() {
+        val diagnosis = diagnoseTargetProcessMissing(
+            targetProcess = "avm3d_service",
+            pidofOutput = "su: permission denied",
+            exactProcessOutput = "",
+            processSnapshot = ""
+        )
+
+        assertEquals("permission", diagnosis.reason)
+    }
+
+    @Test
+    fun diagnoseTargetProcessMissing_detectsPidofMiss() {
+        val diagnosis = diagnoseTargetProcessMissing(
+            targetProcess = "avm3d_service",
+            pidofOutput = "",
+            exactProcessOutput = "root      3456  1  avm3d_service",
+            processSnapshot = ""
+        )
+
+        assertEquals("pidof_miss", diagnosis.reason)
+    }
+
+    @Test
+    fun diagnoseTargetProcessMissing_detectsNameMismatch() {
+        val diagnosis = diagnoseTargetProcessMissing(
+            targetProcess = "avm3d_service",
+            pidofOutput = "",
+            exactProcessOutput = "",
+            processSnapshot = "u0_a123    3456  1000  com.desaysv.inneravmservice"
+        )
+
+        assertEquals("name_mismatch", diagnosis.reason)
+    }
+
+    @Test
+    fun diagnoseTargetProcessMissing_defaultsToNotRunning() {
+        val diagnosis = diagnoseTargetProcessMissing(
+            targetProcess = "avm3d_service",
+            pidofOutput = "",
+            exactProcessOutput = "",
+            processSnapshot = ""
+        )
+
+        assertEquals("not_running", diagnosis.reason)
+    }
+
+    @Test
+    fun parsePidFromPsLine_extractsPidWhenExactProcessExists() {
+        val output = """
+            root      1234  100  avm3d_service
+            u0_a100   2233  200  com.other.app
+        """.trimIndent()
+
+        assertEquals("1234", parsePidFromPsLine(output, "avm3d_service"))
+    }
+
+    @Test
+    fun parseShellProbeResult_extractsExitCodeMarker() {
+        val result = parseShellProbeResult(
+            """
+            line1
+            line2
+            __HA_RC__:7
+            """.trimIndent()
+        )
+
+        assertEquals("line1\nline2", result.output)
+        assertEquals(7, result.exitCode)
+        assertFalse(result.markerMissing)
+    }
 }

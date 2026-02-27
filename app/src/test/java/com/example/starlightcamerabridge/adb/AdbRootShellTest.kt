@@ -20,9 +20,15 @@ class AdbRootShellTest {
     }
 
     @Test
-    fun `wrapCommandWithPassword injects password and escapes quotes`() {
+    fun `wrapCommandWithPassword probes adb root then falls back to su`() {
         val result = AdbRootShell.wrapCommandWithPassword("echo 'hi'", true, "pw123")
-        assertEquals("su -p pw123 -c 'echo '\''hi'\'''", result.raw)
-        assertEquals("su -p *** -c 'echo '\''hi'\'''", result.logSafe)
+        assertEquals(
+            "if [ \"\$(id -u 2>/dev/null)\" = \"0\" ]; then sh -c 'echo '\''hi'\'''; else su -p 'pw123' 0 sh -c 'echo '\''hi'\'''; fi",
+            result.raw
+        )
+        assertEquals(
+            "if [ \"\$(id -u 2>/dev/null)\" = \"0\" ]; then sh -c 'echo '\''hi'\'''; else su -p '***' 0 sh -c 'echo '\''hi'\'''; fi",
+            result.logSafe
+        )
     }
 }

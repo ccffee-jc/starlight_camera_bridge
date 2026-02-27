@@ -3,11 +3,13 @@ package com.example.starlightcamerabridge
 import android.content.Context
 import android.util.Log
 import com.example.starlightcamerabridge.adb.AdbClient
+import com.example.starlightcamerabridge.adb.AdbRootShell
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import org.tukaani.xz.XZInputStream
 import java.io.ByteArrayOutputStream
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * 重复注入跳过窗口（毫秒）。
@@ -99,6 +101,91 @@ internal fun parseProcessKillObservation(rawOutput: String): ProcessKillObservat
     )
 }
 
+internal data class TargetProcessMissingDiagnosis(
+    val reason: String
+)
+
+internal data class TargetPidLookup(
+    val pid: String?,
+    val source: String
+)
+
+internal data class ShellProbeResult(
+    val output: String,
+    val exitCode: Int?,
+    val markerMissing: Boolean
+)
+
+internal fun parseShellProbeResult(rawOutput: String, marker: String = "__HA_RC__:"): ShellProbeResult {
+    val lines = rawOutput.lineSequence().toList()
+    val markerLine = lines.lastOrNull { it.trim().startsWith(marker) }
+    if (markerLine == null) {
+        return ShellProbeResult(
+            output = rawOutput.trim(),
+            exitCode = null,
+            markerMissing = true
+        )
+    }
+    val exitCode = markerLine.trim().removePrefix(marker).trim().toIntOrNull()
+    val outputLines = lines.dropLast(1)
+    return ShellProbeResult(
+        output = outputLines.joinToString("\n").trim(),
+        exitCode = exitCode,
+        markerMissing = false
+    )
+}
+
+internal fun parsePidFromPsLine(psOutput: String, processName: String): String? {
+    if (psOutput.isBlank()) return null
+    val nameRegex = Regex("(^|\\s)${Regex.escape(processName)}(\\s|$)")
+    val pidRegex = Regex("\\b\\d+\\b")
+    for (line in psOutput.lineSequence()) {
+        val trimmed = line.trim()
+        if (trimmed.isEmpty()) continue
+        if (!nameRegex.containsMatchIn(trimmed)) continue
+        val pid = pidRegex.find(trimmed)?.value
+        if (!pid.isNullOrBlank()) return pid
+    }
+    return null
+}
+
+internal fun diagnoseTargetProcessMissing(
+    targetProcess: String,
+    pidofOutput: String,
+    exactProcessOutput: String,
+    processSnapshot: String
+): TargetProcessMissingDiagnosis {
+    val lowerPidof = pidofOutput.lowercase()
+    val lowerExact = exactProcessOutput.lowercase()
+    val lowerSnapshot = processSnapshot.lowercase()
+    val merged = "$lowerPidof\n$lowerExact\n$lowerSnapshot"
+
+    val permissionKeywords = listOf(
+        "permission denied",
+        "operation not permitted",
+        "not permitted",
+        "the password is incorrect",
+        "authentication failure",
+        "su:",
+        "access denied"
+    )
+    if (permissionKeywords.any { merged.contains(it) }) {
+        return TargetProcessMissingDiagnosis(reason = "permission")
+    }
+
+    if (lowerExact.contains(targetProcess.lowercase())) {
+        return TargetProcessMissingDiagnosis(reason = "pidof_miss")
+    }
+
+    val hasTargetName = lowerSnapshot.contains(targetProcess.lowercase())
+    val hasRelatedName = listOf("avm3d", "inneravm", "desaysv").any { lowerSnapshot.contains(it) }
+    if (!hasTargetName && hasRelatedName) {
+        return TargetProcessMissingDiagnosis(reason = "name_mismatch")
+    }
+
+    return TargetProcessMissingDiagnosis(reason = "not_running")
+}
+
 /**
  * Frida 部署与注入管理器。
  *
@@ -165,6 +252,14 @@ class FridaDeployer(private val appContext: Context) {
         // 重注入等待参数
         const val REINJECT_RESTART_WAIT_TIMEOUT_MS = 8000L
         const val REINJECT_RESTART_POLL_MS = 200L
+
+        // 目标进程轮询等待参数
+        const val TARGET_PID_WAIT_POLL_MS = 200L
+        const val TARGET_PID_WAIT_TIMEOUT_MS = 5000L
+        const val TARGET_PID_WAKE_RETRY_TIMEOUT_MS = 3000L
+
+        // 全局注入互斥，覆盖 UI/广播等多入口并发触发
+        val injectOperationRunning = AtomicBoolean(false)
     }
 
     /**
@@ -233,8 +328,149 @@ class FridaDeployer(private val appContext: Context) {
      * @return PID，未找到返回 null
      */
     private suspend fun findTargetPid(client: AdbClient): String? {
-        val out = client.executeShellCommand("pidof $TARGET_PROCESS 2>/dev/null").trim()
-        return out.split("\\s+".toRegex()).firstOrNull { it.isNotEmpty() }
+        return findTargetPidWithSource(client).pid
+    }
+
+    private suspend fun findTargetPidWithSource(client: AdbClient): TargetPidLookup {
+        val pidofOutput = client.executeShellCommand("pidof $TARGET_PROCESS 2>/dev/null").trim()
+        val pidFromPidof = pidofOutput.split("\\s+".toRegex()).firstOrNull { it.isNotEmpty() }
+        if (!pidFromPidof.isNullOrBlank()) {
+            return TargetPidLookup(pid = pidFromPidof, source = "pidof")
+        }
+        val psOutput = client.executeShellCommand(
+            "ps -A 2>/dev/null | grep -F $TARGET_PROCESS 2>/dev/null || true"
+        ).trim()
+        val pidFromPs = parsePidFromPsLine(psOutput, TARGET_PROCESS)
+        if (!pidFromPs.isNullOrBlank()) {
+            return TargetPidLookup(pid = pidFromPs, source = "ps_fallback")
+        }
+        return TargetPidLookup(pid = null, source = "none")
+    }
+
+    private suspend fun waitForTargetPid(
+        client: AdbClient,
+        timeoutMs: Long,
+        pollMs: Long = TARGET_PID_WAIT_POLL_MS
+    ): TargetPidLookup? {
+        val start = System.currentTimeMillis()
+        while (true) {
+            val lookup = findTargetPidWithSource(client)
+            if (!lookup.pid.isNullOrBlank()) return lookup
+            val elapsed = (System.currentTimeMillis() - start).coerceAtLeast(0)
+            if (elapsed >= timeoutMs) return null
+            delay(pollMs)
+        }
+    }
+
+    private suspend fun findTargetPidWithRecovery(
+        client: AdbClient,
+        log: LogCallback,
+        stageLabel: String,
+        allowWakeUp: Boolean
+    ): TargetPidLookup? {
+        val immediate = findTargetPidWithSource(client)
+        if (!immediate.pid.isNullOrBlank()) return immediate
+
+        log.onLog("⏳ $stageLabel：等待 $TARGET_PROCESS 拉起（最多 ${TARGET_PID_WAIT_TIMEOUT_MS / 1000}s）...")
+        val waited = waitForTargetPid(client, timeoutMs = TARGET_PID_WAIT_TIMEOUT_MS)
+        if (waited != null) {
+            log.onLog("✅ $stageLabel：轮询后捕获到目标 PID=${waited.pid}")
+            return waited
+        }
+
+        if (!allowWakeUp) return null
+
+        log.onLog("⚠️ $stageLabel：轮询超时，尝试唤起 360 Activity 再次等待")
+        val wakeOutput = client.executeShellCommand("$AVM_ACTIVITY_START_CMD 2>&1").trim()
+        if (wakeOutput.isNotBlank()) {
+            log.onLog("📋 Activity 唤起输出:\n${truncateForUi(wakeOutput, 500)}")
+        }
+        delay(AVM_ACTIVITY_STABILIZE_DELAY_MS)
+
+        val retried = waitForTargetPid(client, timeoutMs = TARGET_PID_WAKE_RETRY_TIMEOUT_MS)
+        if (retried != null) {
+            log.onLog("✅ $stageLabel：Activity 唤起后捕获到目标 PID=${retried.pid}")
+        }
+        return retried
+    }
+
+    private suspend fun runShellProbe(client: AdbClient, command: String): Pair<AdbRootShell.RootCommand, ShellProbeResult> {
+        val marker = "__HA_RC__:"
+        val wrapped = AdbRootShell.wrapIfEnabled(appContext, command)
+        val raw = client.executeShellCommand("$command; echo $marker\$?")
+        return wrapped to parseShellProbeResult(raw, marker = marker)
+    }
+
+    private suspend fun explainMissingTargetProcess(
+        client: AdbClient,
+        log: LogCallback
+    ) {
+        val (pidofCommand, pidofProbe) = runShellProbe(client, "pidof $TARGET_PROCESS 2>&1")
+        val (exactPsCommand, exactPsProbe) = runShellProbe(
+            client,
+            "ps -A 2>&1 | grep -F $TARGET_PROCESS || true"
+        )
+        val (snapshotCommand, snapshotProbe) = runShellProbe(
+            client,
+            "ps -A 2>&1 | grep -F avm3d || true; " +
+                "ps -A 2>&1 | grep -F inneravm || true; " +
+                "ps -A 2>&1 | grep -F desaysv || true"
+        )
+        val pidFromPsFallback = parsePidFromPsLine(exactPsProbe.output, TARGET_PROCESS)
+        log.onLog("🔧 诊断命令 pidof: ${truncateForUi(pidofCommand.logSafe, 260)}")
+        log.onLog("🔧 诊断命令 ps精确: ${truncateForUi(exactPsCommand.logSafe, 260)}")
+        log.onLog("🔧 诊断命令 ps快照: ${truncateForUi(snapshotCommand.logSafe, 260)}")
+        log.onLog(
+            "📎 命令返回码: pidof=${pidofProbe.exitCode ?: "N/A"}, " +
+                "ps精确=${exactPsProbe.exitCode ?: "N/A"}, ps快照=${snapshotProbe.exitCode ?: "N/A"}"
+        )
+        if (pidofProbe.markerMissing || exactPsProbe.markerMissing || snapshotProbe.markerMissing) {
+            log.onLog("⚠️ 诊断命令返回码标记缺失，可能存在 shell 包装或命令链路异常")
+        }
+
+        val diagnosis = diagnoseTargetProcessMissing(
+            targetProcess = TARGET_PROCESS,
+            pidofOutput = pidofProbe.output,
+            exactProcessOutput = exactPsProbe.output,
+            processSnapshot = snapshotProbe.output
+        )
+
+        when (diagnosis.reason) {
+            "permission" -> {
+                log.onLog("🔍 判定：更可能是权限问题（su/提权失败或命令被拒绝）")
+            }
+            "pidof_miss" -> {
+                log.onLog(
+                    "🔍 判定：pidof 未命中，但 ps 能看到 $TARGET_PROCESS，" +
+                        "更可能是工具差异或当前权限上下文导致 pidof 失效"
+                )
+            }
+            "name_mismatch" -> {
+                log.onLog("🔍 判定：更可能是进程名称不匹配（设备上的实际名称与 $TARGET_PROCESS 不一致）")
+            }
+            else -> {
+                log.onLog("🔍 判定：目标进程当前未启动（未发现相关 AVM 进程）")
+            }
+        }
+
+        if (pidofProbe.output.isNotBlank()) {
+            log.onLog("📋 pidof 输出:\n${truncateForUi(pidofProbe.output)}")
+        }
+        if (exactPsProbe.output.isNotBlank()) {
+            log.onLog("📋 ps 精确匹配输出:\n${truncateForUi(exactPsProbe.output)}")
+        }
+        if (!pidFromPsFallback.isNullOrBlank()) {
+            log.onLog("📌 ps 回退可解析到 PID=$pidFromPsFallback（可用于进一步排查 pidof 兼容性）")
+        }
+        if (snapshotProbe.output.isNotBlank()) {
+            log.onLog("📋 相关进程快照:\n${truncateForUi(snapshotProbe.output)}")
+        }
+    }
+
+    private fun truncateForUi(text: String, maxChars: Int = 1200): String {
+        val normalized = text.trim()
+        if (normalized.length <= maxChars) return normalized
+        return normalized.take(maxChars) + "\n...（输出已截断）"
     }
 
     /**
@@ -552,6 +788,10 @@ class FridaDeployer(private val appContext: Context) {
      * @param log 日志回调
      */
     suspend fun inject(host: String, port: Int, log: LogCallback) {
+        if (!injectOperationRunning.compareAndSet(false, true)) {
+            log.onLog("⚠️ 已有注入流程执行中（含目标进程轮询），跳过重复注入请求")
+            return
+        }
         val client = AdbClient(appContext)
         var retainInjectingMarker = false
         try {
@@ -564,12 +804,23 @@ class FridaDeployer(private val appContext: Context) {
 
             // 2. 检查目标进程
             log.onLog("🔍 查找目标进程 $TARGET_PROCESS...")
-            val pid = findTargetPid(client)
+            val pidLookup = findTargetPidWithRecovery(
+                client = client,
+                log = log,
+                stageLabel = "初次查找目标进程",
+                allowWakeUp = true
+            )
+            val pid = pidLookup?.pid
             if (pid == null) {
                 log.onLog("❌ 目标进程 $TARGET_PROCESS 未运行，无法注入")
+                explainMissingTargetProcess(client, log)
                 return
             }
-            log.onLog("✅ 找到目标进程 PID=$pid")
+            if (pidLookup.source == "ps_fallback") {
+                log.onLog("✅ 通过 ps 回退找到目标进程 PID=$pid（pidof 未命中）")
+            } else {
+                log.onLog("✅ 找到目标进程 PID=$pid")
+            }
 
             val bridgeSocketReady = isBridgeSocketReady(client)
             if (bridgeSocketReady) {
@@ -692,9 +943,19 @@ class FridaDeployer(private val appContext: Context) {
             restartInnerAvmBeforeInject(client, log)
 
             // 8. 使用 frida-inject 注入脚本
-            val freshPid = findTargetPid(client) ?: run {
+            val freshPidLookup = findTargetPidWithRecovery(
+                client = client,
+                log = log,
+                stageLabel = "注入前复查目标进程",
+                allowWakeUp = true
+            )
+            val freshPid = freshPidLookup?.pid ?: run {
                 log.onLog("❌ 目标进程已消失，无法注入")
+                explainMissingTargetProcess(client, log)
                 return
+            }
+            if (freshPidLookup.source == "ps_fallback") {
+                log.onLog("ℹ️ 注入前目标 PID 由 ps 回退识别（pidof 未命中）")
             }
             log.onLog("💉 使用 frida-inject 注入到 PID=$freshPid...")
             val injectOutput = client.executeShellCommand(
@@ -755,6 +1016,7 @@ class FridaDeployer(private val appContext: Context) {
                 runCatching { clearInjectingInProgressMarker(client) }
             }
             client.close()
+            injectOperationRunning.set(false)
         }
     }
 
