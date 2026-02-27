@@ -78,6 +78,27 @@ internal fun shouldRestartInnerAvmProcess(previousPid: String?, currentPid: Stri
     return previousPid == currentPid
 }
 
+internal data class ProcessKillObservation(
+    val killExitCode: Int?,
+    val pidAfterKill: String?,
+    val passwordRejected: Boolean,
+    val markerMissing: Boolean
+)
+
+internal fun parseProcessKillObservation(rawOutput: String): ProcessKillObservation {
+    val rcPrefix = "__KILL_RC__:"
+    val pidPrefix = "__KILL_PID__:"
+    val lines = rawOutput.lineSequence().map { it.trim() }.toList()
+    val rcRaw = lines.firstOrNull { it.startsWith(rcPrefix) }?.removePrefix(rcPrefix)?.trim()
+    val pidRaw = lines.firstOrNull { it.startsWith(pidPrefix) }?.removePrefix(pidPrefix)?.trim()
+    return ProcessKillObservation(
+        killExitCode = rcRaw?.toIntOrNull(),
+        pidAfterKill = pidRaw?.takeIf { it.isNotEmpty() },
+        passwordRejected = rawOutput.contains("The Password is incorrect", ignoreCase = true),
+        markerMissing = rcRaw == null || pidRaw == null
+    )
+}
+
 /**
  * Frida 部署与注入管理器。
  *
@@ -128,6 +149,12 @@ class FridaDeployer(private val appContext: Context) {
         // innerAvmService 重绑等待参数
         const val INNER_AVM_REBIND_POLL_MS = 300L
         const val INNER_AVM_REBIND_WAIT_TIMEOUT_MS = 8000L
+
+        // 注入前重启 innerAvmService 等待参数
+        const val INNER_AVM_PREINJECT_RESTART_POLL_MS = 200L
+        const val INNER_AVM_PREINJECT_RESTART_TIMEOUT_MS = 3000L
+        const val INNER_AVM_FORCE_STOP_POLL_MS = 200L
+        const val INNER_AVM_FORCE_STOP_TIMEOUT_MS = 2000L
 
         // bridge socket 就绪等待参数
         const val BRIDGE_READY_WAIT_POLL_MS = 200L
@@ -311,6 +338,83 @@ class FridaDeployer(private val appContext: Context) {
             }
         }
         log.onLog("⚠️ inneravmservice 重启等待超时，将继续按拉起 Activity 路径触发")
+    }
+
+    /**
+     * 注入前重启 innerAvmService，避免复用旧实例导致首帧链路不触发。
+     *
+     * 当前观测到在部分场景下，innerAvmService 保持旧 PID 时，`am start` 仅投递给
+     * 现有 top-most 实例，可能无法触发有效首帧，进而导致 bridge socket 长时间未就绪。
+     */
+    private suspend fun restartInnerAvmBeforeInject(
+        client: AdbClient,
+        log: LogCallback
+    ) {
+        val innerPidBefore = findInnerAvmPid(client)
+        if (innerPidBefore.isNullOrBlank()) {
+            log.onLog("ℹ️ 注入前 inneravmservice 未运行，后续通过 Activity 按需拉起")
+            return
+        }
+
+        log.onLog("🔄 注入前重启 inneravmservice (PID=$innerPidBefore)，确保链路冷启动")
+        val killRaw = client.executeShellCommand(
+            "kill -9 $innerPidBefore >/dev/null 2>&1; " +
+                "echo __KILL_RC__:\$?; " +
+                "echo __KILL_PID__:\$(pidof $INNER_AVM_PROCESS 2>/dev/null)"
+        )
+        val killObservation = parseProcessKillObservation(killRaw)
+        when {
+            killObservation.passwordRejected -> {
+                log.onLog("⚠️ kill inneravmservice 失败：su 校验未通过（可能密码不正确）")
+            }
+            killObservation.markerMissing -> {
+                val safeOutput = killRaw.trim().ifBlank { "<empty>" }
+                log.onLog("⚠️ kill inneravmservice 结果不可解析：$safeOutput")
+            }
+            killObservation.killExitCode != 0 -> {
+                val pidAfter = killObservation.pidAfterKill ?: "<none>"
+                log.onLog("⚠️ kill inneravmservice 返回码=${killObservation.killExitCode}，PID快照=$pidAfter")
+            }
+            else -> {
+                val pidAfter = killObservation.pidAfterKill ?: "<none>"
+                log.onLog("✅ kill inneravmservice 命令已执行，PID快照=$pidAfter")
+            }
+        }
+
+        val deadlineAt = System.currentTimeMillis() + INNER_AVM_PREINJECT_RESTART_TIMEOUT_MS
+        while (System.currentTimeMillis() < deadlineAt) {
+            delay(INNER_AVM_PREINJECT_RESTART_POLL_MS)
+            val refreshed = findInnerAvmPid(client)
+            if (refreshed.isNullOrBlank()) {
+                log.onLog("✅ inneravmservice 已退出，等待后续 Activity 拉起新实例")
+                return
+            }
+            if (refreshed != innerPidBefore) {
+                log.onLog("✅ inneravmservice 已重启，新的 PID=$refreshed")
+                return
+            }
+        }
+
+        log.onLog("⚠️ 注入前 inneravmservice 重启等待超时，执行 force-stop 兜底")
+        val forceStopOut = client.executeShellCommand("am force-stop $INNER_AVM_PROCESS 2>&1").trim()
+        if (forceStopOut.isNotBlank()) {
+            log.onLog("📋 force-stop 输出: $forceStopOut")
+        }
+        val forceStopDeadlineAt = System.currentTimeMillis() + INNER_AVM_FORCE_STOP_TIMEOUT_MS
+        while (System.currentTimeMillis() < forceStopDeadlineAt) {
+            delay(INNER_AVM_FORCE_STOP_POLL_MS)
+            val refreshed = findInnerAvmPid(client)
+            if (refreshed.isNullOrBlank()) {
+                log.onLog("✅ force-stop 后 inneravmservice 已停止，后续按冷启动路径拉起")
+                return
+            }
+            if (refreshed != innerPidBefore) {
+                log.onLog("✅ force-stop 后 inneravmservice 已切换新 PID=$refreshed")
+                return
+            }
+        }
+        val lastPid = findInnerAvmPid(client).orEmpty().ifBlank { "<none>" }
+        log.onLog("⚠️ force-stop 兜底未观察到 PID 变化（当前 PID=$lastPid），继续执行注入")
     }
 
     // ========== AVM 控制 ==========
@@ -584,7 +688,10 @@ class FridaDeployer(private val appContext: Context) {
                 log.onLog("✅ frida-server 已在运行")
             }
 
-            // 7. 使用 frida-inject 注入脚本
+            // 7. 注入前重启 inneravmservice，避免旧实例导致首帧迟迟不触发
+            restartInnerAvmBeforeInject(client, log)
+
+            // 8. 使用 frida-inject 注入脚本
             val freshPid = findTargetPid(client) ?: run {
                 log.onLog("❌ 目标进程已消失，无法注入")
                 return
@@ -596,7 +703,7 @@ class FridaDeployer(private val appContext: Context) {
             )
             delay(1000)
 
-            // 8. 验证注入结果
+            // 9. 验证注入结果
             val injectLog = client.executeShellCommand("cat $REMOTE_TMP/frida_inject.log 2>/dev/null").trim()
             if (injectLog.isNotEmpty()) {
                 log.onLog("📋 frida-inject 输出:\n$injectLog")
@@ -615,10 +722,10 @@ class FridaDeployer(private val appContext: Context) {
             if (isRcZero && !hasError) {
                 log.onLog("✅ 注入完成（eternalize 模式，脚本已常驻目标进程）")
 
-                // 9. 优先激活一次 360，再等待 bridge 就绪
+                // 10. 优先激活一次 360，再等待 bridge 就绪
                 activateAvmViaActivity(client, log)
 
-                // 10. 确认 bridge socket 就绪
+                // 11. 确认 bridge socket 就绪
                 val bridgeReady = ensureBridgeSocketReadyAfterInject(client, log)
 
                 if (bridgeReady) {

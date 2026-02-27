@@ -72,4 +72,29 @@ class FridaDeployerPolicyTest {
         assertTrue(decision.shouldSkip)
         assertEquals("socket_ready", decision.reason)
     }
+
+    @Test
+    fun parseProcessKillObservation_parsesMarkers() {
+        val observation = parseProcessKillObservation(
+            """
+            __KILL_RC__:0
+            __KILL_PID__:1234
+            """.trimIndent()
+        )
+
+        assertEquals(0, observation.killExitCode)
+        assertEquals("1234", observation.pidAfterKill)
+        assertFalse(observation.passwordRejected)
+        assertFalse(observation.markerMissing)
+    }
+
+    @Test
+    fun parseProcessKillObservation_detectsPasswordFailureWhenMarkersMissing() {
+        val observation = parseProcessKillObservation("The Password is incorrect")
+
+        assertEquals(null, observation.killExitCode)
+        assertEquals(null, observation.pidAfterKill)
+        assertTrue(observation.passwordRejected)
+        assertTrue(observation.markerMissing)
+    }
 }
