@@ -9,6 +9,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * 广播接收器，用于通过 ADB 命令触发 Frida 注入/恢复。
@@ -23,6 +24,7 @@ class FridaInjectReceiver : BroadcastReceiver() {
         private const val TAG = "FridaInjectReceiver"
         const val ACTION_INJECT = "com.example.starlightcamerabridge.ACTION_INJECT"
         const val ACTION_RESTORE = "com.example.starlightcamerabridge.ACTION_RESTORE"
+        private val operationRunning = AtomicBoolean(false)
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -47,16 +49,32 @@ class FridaInjectReceiver : BroadcastReceiver() {
         when (action) {
             ACTION_INJECT -> {
                 scope.launch {
+                    if (!operationRunning.compareAndSet(false, true)) {
+                        Log.w(TAG, "已有注入/恢复流程执行中，忽略重复注入广播")
+                        return@launch
+                    }
                     Log.i(TAG, "===== 开始注入 =====")
-                    deployer.inject(host, port, logCallback)
-                    Log.i(TAG, "===== 注入流程结束 =====")
+                    try {
+                        deployer.inject(host, port, logCallback)
+                    } finally {
+                        operationRunning.set(false)
+                        Log.i(TAG, "===== 注入流程结束 =====")
+                    }
                 }
             }
             ACTION_RESTORE -> {
                 scope.launch {
+                    if (!operationRunning.compareAndSet(false, true)) {
+                        Log.w(TAG, "已有注入/恢复流程执行中，忽略恢复广播")
+                        return@launch
+                    }
                     Log.i(TAG, "===== 开始恢复 =====")
-                    deployer.restore(host, port, logCallback)
-                    Log.i(TAG, "===== 恢复流程结束 =====")
+                    try {
+                        deployer.restore(host, port, logCallback)
+                    } finally {
+                        operationRunning.set(false)
+                        Log.i(TAG, "===== 恢复流程结束 =====")
+                    }
                 }
             }
         }

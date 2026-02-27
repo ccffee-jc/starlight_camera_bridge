@@ -28,6 +28,43 @@ internal fun shouldSkipDuplicateInjection(lastInjectAtMs: Long, nowMs: Long): Bo
     return elapsed < DUPLICATE_INJECT_SKIP_WINDOW_MS
 }
 
+internal data class DuplicateInjectDecision(
+    val shouldSkip: Boolean,
+    val reason: String
+)
+
+internal fun decideDuplicateInjection(
+    lastInjectAtMs: Long,
+    nowMs: Long,
+    bridgeSocketReady: Boolean,
+    lastInjectPid: String?,
+    currentPid: String
+): DuplicateInjectDecision {
+    if (!shouldSkipDuplicateInjection(lastInjectAtMs, nowMs)) {
+        return DuplicateInjectDecision(
+            shouldSkip = false,
+            reason = "outside_window"
+        )
+    }
+    if (bridgeSocketReady) {
+        return DuplicateInjectDecision(
+            shouldSkip = true,
+            reason = "socket_ready"
+        )
+    }
+    val lastPid = lastInjectPid?.trim().orEmpty()
+    if (lastPid.isNotEmpty() && lastPid != currentPid) {
+        return DuplicateInjectDecision(
+            shouldSkip = false,
+            reason = "pid_changed"
+        )
+    }
+    return DuplicateInjectDecision(
+        shouldSkip = false,
+        reason = "socket_missing"
+    )
+}
+
 /**
  * 判断 innerAvmService 是否需要被重启。
  *
@@ -70,6 +107,7 @@ class FridaDeployer(private val appContext: Context) {
         const val REMOTE_HOOK_SCRIPT = "$REMOTE_TMP/stealth_camera_v3.js"
         const val REMOTE_BRIDGE_SOCKET = "$REMOTE_TMP/starlight_bridge.sock"
         const val REMOTE_LAST_INJECT_MARKER = "$REMOTE_TMP/starlight_bridge_last_inject_ms"
+        const val REMOTE_INJECTING_MARKER = "$REMOTE_TMP/starlight_bridge_injecting"
 
         // 目标进程
         const val TARGET_PROCESS = "avm3d_service"
@@ -78,7 +116,7 @@ class FridaDeployer(private val appContext: Context) {
         // 360 Activity 唤起（用于触发相机/视频流激活）
         const val AVM_ACTIVITY_COMPONENT = "com.desaysv.inneravmservice/.InnerAvmActivity"
         const val AVM_ACTIVITY_START_CMD = "am start -n $AVM_ACTIVITY_COMPONENT"
-        const val AVM_ACTIVITY_STABILIZE_DELAY_MS = 3000L
+        const val AVM_ACTIVITY_STABILIZE_DELAY_MS = 800L
 
         // AVM 收口广播
         const val AVM_CONTROL_ACTION = "com.desaysv.action.control_inner_avm"
@@ -92,13 +130,14 @@ class FridaDeployer(private val appContext: Context) {
         const val INNER_AVM_REBIND_WAIT_TIMEOUT_MS = 8000L
 
         // bridge socket 就绪等待参数
-        const val BRIDGE_READY_WAIT_POLL_MS = 300L
-        const val BRIDGE_READY_WAIT_TIMEOUT_MS = 6000L
-        const val BRIDGE_READY_WAIT_RETRY_TIMEOUT_MS = 8000L
-        const val BRIDGE_READY_WAKE_RETRY_COUNT = 1
+        const val BRIDGE_READY_WAIT_POLL_MS = 200L
+        const val BRIDGE_READY_WAIT_TIMEOUT_MS = 1500L
+        const val BRIDGE_READY_WAIT_RETRY_TIMEOUT_MS = 2500L
+        const val BRIDGE_READY_WAKE_RETRY_COUNT = 2
 
         // 重注入等待参数
-        const val REINJECT_RESTART_WAIT_MS = 3000L
+        const val REINJECT_RESTART_WAIT_TIMEOUT_MS = 8000L
+        const val REINJECT_RESTART_POLL_MS = 200L
     }
 
     /**
@@ -218,18 +257,17 @@ class FridaDeployer(private val appContext: Context) {
         log.onLog("🔁 重复注入：先重启目标进程 $TARGET_PROCESS (PID=$oldPid)")
         client.executeShellCommand("kill -9 $oldPid 2>/dev/null || true")
 
-        log.onLog("⏳ 等待 3 秒让系统重启目标进程...")
-        delay(REINJECT_RESTART_WAIT_MS)
-
-        val current = findTargetPid(client)
-        if (current.isNullOrBlank()) {
-            return null
+        log.onLog("⏳ 等待目标进程拉起（最多 ${REINJECT_RESTART_WAIT_TIMEOUT_MS / 1000}s）...")
+        val deadlineAt = System.currentTimeMillis() + REINJECT_RESTART_WAIT_TIMEOUT_MS
+        while (System.currentTimeMillis() < deadlineAt) {
+            val current = findTargetPid(client)
+            if (!current.isNullOrBlank() && current != oldPid) {
+                return current
+            }
+            delay(REINJECT_RESTART_POLL_MS)
         }
-        if (current == oldPid) {
-            log.onLog("⚠️ 检测到 PID 未变化，目标进程可能未完成重启")
-            return null
-        }
-        return current
+        log.onLog("⚠️ 目标进程重启等待超时，仍未拿到新 PID")
+        return null
     }
 
     /**
@@ -302,9 +340,9 @@ class FridaDeployer(private val appContext: Context) {
     }
 
     /**
-     * 注入后通过 Activity 路径触发一次 360 相机链路，然后通过广播收口。
+     * 注入后通过 Activity 路径触发一次 360 相机链路。
      */
-    private suspend fun wakeAvmViaActivity(client: AdbClient, log: LogCallback) {
+    private suspend fun activateAvmViaActivity(client: AdbClient, log: LogCallback) {
         log.onLog("🎯 注入后触发 360 Activity: $AVM_ACTIVITY_COMPONENT")
         val startOut = client.executeShellCommand("$AVM_ACTIVITY_START_CMD 2>&1").trim()
         if (startOut.contains("Error", ignoreCase = true) ||
@@ -319,8 +357,12 @@ class FridaDeployer(private val appContext: Context) {
 
         // 给系统一个窗口完成相机链路激活
         delay(AVM_ACTIVITY_STABILIZE_DELAY_MS)
+    }
 
-        // 使用广播执行 AVM 收口（不发送按键）
+    /**
+     * 在 bridge 就绪后通过广播收口 AVM。
+     */
+    private suspend fun closeAvmAfterBridgeReady(client: AdbClient, log: LogCallback) {
         log.onLog("ℹ️ 使用广播执行 AVM 收口（不发送按键）")
         exitAvmViaBroadcast(client, log)
     }
@@ -363,7 +405,7 @@ class FridaDeployer(private val appContext: Context) {
         for (i in 0 until BRIDGE_READY_WAKE_RETRY_COUNT) {
             val attempt = i + 1
             log.onLog("⚠️ bridge socket 未就绪，尝试补偿激活 360（$attempt/$BRIDGE_READY_WAKE_RETRY_COUNT）")
-            wakeAvmViaActivity(client, log)
+            activateAvmViaActivity(client, log)
             if (waitBridgeSocketReady(client, BRIDGE_READY_WAIT_RETRY_TIMEOUT_MS)) {
                 log.onLog("✅ bridge socket 已就绪（补偿激活后）")
                 return true
@@ -384,6 +426,18 @@ class FridaDeployer(private val appContext: Context) {
         )
     }
 
+    private suspend fun markInjectingInProgress(client: AdbClient) {
+        val nowMs = System.currentTimeMillis()
+        client.executeShellCommand(
+            "echo $nowMs > $REMOTE_INJECTING_MARKER 2>/dev/null; " +
+                "chmod 644 $REMOTE_INJECTING_MARKER 2>/dev/null || true"
+        )
+    }
+
+    private suspend fun clearInjectingInProgressMarker(client: AdbClient) {
+        client.executeShellCommand("rm -f $REMOTE_INJECTING_MARKER 2>/dev/null || true")
+    }
+
     // ========== 核心操作 ==========
 
     /**
@@ -395,11 +449,14 @@ class FridaDeployer(private val appContext: Context) {
      */
     suspend fun inject(host: String, port: Int, log: LogCallback) {
         val client = AdbClient(appContext)
+        var retainInjectingMarker = false
         try {
             // 1. 连接
             log.onLog("⏳ 连接 ADB ($host:$port)...")
             client.connect(host, port)
             log.onLog("✅ ADB 已连接")
+            markInjectingInProgress(client)
+            log.onLog("ℹ️ 已写入注入中标记")
 
             // 2. 检查目标进程
             log.onLog("🔍 查找目标进程 $TARGET_PROCESS...")
@@ -410,34 +467,50 @@ class FridaDeployer(private val appContext: Context) {
             }
             log.onLog("✅ 找到目标进程 PID=$pid")
 
+            val bridgeSocketReady = isBridgeSocketReady(client)
+            if (bridgeSocketReady) {
+                log.onLog("✅ bridge socket 已就绪，跳过重复注入")
+                val injectAtMs = System.currentTimeMillis()
+                FridaInjectTimestampPreferences.setLastInjectAtMs(appContext, injectAtMs)
+                FridaInjectTimestampPreferences.setLastInjectPid(appContext, pid)
+                syncLastInjectMarker(client, injectAtMs)
+                log.onLog("🕒 已刷新注入时间标记")
+                return
+            }
+
             // 3. 基于时间戳的重复注入检测
             val nowMs = System.currentTimeMillis()
             val lastInjectAtMs = FridaInjectTimestampPreferences.getLastInjectAtMs(appContext)
-
-            // 记录是否为重注入（需要在注入成功后确保 innerAvm 重绑）
-            var isReinject = false
-            var innerAvmPidBeforeRestart: String? = null
+            val lastInjectPid = FridaInjectTimestampPreferences.getLastInjectPid(appContext)
 
             if (lastInjectAtMs > 0) {
                 val elapsed = (nowMs - lastInjectAtMs).coerceAtLeast(0)
-                if (shouldSkipDuplicateInjection(lastInjectAtMs, nowMs)) {
+                val duplicateDecision = decideDuplicateInjection(
+                    lastInjectAtMs = lastInjectAtMs,
+                    nowMs = nowMs,
+                    bridgeSocketReady = bridgeSocketReady,
+                    lastInjectPid = lastInjectPid,
+                    currentPid = pid
+                )
+                if (duplicateDecision.shouldSkip) {
                     log.onLog("⚠️ 检测到重复注入触发，距离上次注入仅 ${elapsed / 1000}s")
                     log.onLog("⏭️ 小于 60 秒窗口，直接跳过本次注入")
                     return
                 }
-
-                log.onLog("ℹ️ 距离上次注入 ${elapsed / 1000}s，超过 60 秒，执行重启后注入")
-
-                // 记录重启前 innerAvm PID
-                innerAvmPidBeforeRestart = findInnerAvmPid(client)
-
-                val restartedPid = restartTargetProcessForReinject(client, pid, log)
-                if (restartedPid == null) {
-                    log.onLog("❌ 目标进程重启失败或超时，取消本次注入")
-                    return
+                when (duplicateDecision.reason) {
+                    "pid_changed" -> {
+                        log.onLog(
+                            "ℹ️ 距离上次注入 ${elapsed / 1000}s，但目标 PID 已变化 " +
+                                "($lastInjectPid -> $pid)，忽略 60 秒窗口强制重注入"
+                        )
+                    }
+                    "socket_missing" -> {
+                        log.onLog("ℹ️ 距离上次注入 ${elapsed / 1000}s，但 bridge socket 缺失，忽略 60 秒窗口强制重注入")
+                    }
+                    else -> {
+                        log.onLog("ℹ️ 距离上次注入 ${elapsed / 1000}s，执行直接重注入（不重启目标进程）")
+                    }
                 }
-                log.onLog("✅ 目标进程已重启，新的 PID=$restartedPid")
-                isReinject = true
             }
 
             // 4. 逐文件检查 & 只推送缺失的文件
@@ -542,24 +615,22 @@ class FridaDeployer(private val appContext: Context) {
             if (isRcZero && !hasError) {
                 log.onLog("✅ 注入完成（eternalize 模式，脚本已常驻目标进程）")
 
-                // 如果是重注入，确保 innerAvmService 完成重绑
-                if (isReinject) {
-                    ensureInnerAvmReboundAfterTargetRestart(client, innerAvmPidBeforeRestart, log)
-                }
-
-                // 9. 走一次 Activity 路径激活相机流
-                wakeAvmViaActivity(client, log)
+                // 9. 优先激活一次 360，再等待 bridge 就绪
+                activateAvmViaActivity(client, log)
 
                 // 10. 确认 bridge socket 就绪
                 val bridgeReady = ensureBridgeSocketReadyAfterInject(client, log)
 
                 if (bridgeReady) {
+                    closeAvmAfterBridgeReady(client, log)
                     val injectAtMs = System.currentTimeMillis()
                     FridaInjectTimestampPreferences.setLastInjectAtMs(appContext, injectAtMs)
+                    FridaInjectTimestampPreferences.setLastInjectPid(appContext, freshPid)
                     syncLastInjectMarker(client, injectAtMs)
                     log.onLog("🕒 已写入本次注入时间标记")
                 } else {
-                    log.onLog("⚠️ bridge socket 仍未就绪，暂不写入注入时间标记，允许哨兵快速重试")
+                    retainInjectingMarker = true
+                    log.onLog("⚠️ bridge socket 仍未就绪，跳过收口并暂不写入注入时间标记，允许哨兵快速重试")
                 }
             } else {
                 val displayExit = exitCode.ifBlank { "unknown" }
@@ -573,6 +644,9 @@ class FridaDeployer(private val appContext: Context) {
             Log.e(TAG, "inject failed", e)
             log.onLog("❌ 错误: ${e.message}")
         } finally {
+            if (!retainInjectingMarker) {
+                runCatching { clearInjectingInProgressMarker(client) }
+            }
             client.close()
         }
     }
@@ -639,7 +713,7 @@ class FridaDeployer(private val appContext: Context) {
         // 清理中间文件（保留 frida-server/frida-inject 二进制）
         client.executeShellCommand(
             "rm -f $REMOTE_HOOK_SCRIPT $REMOTE_TMP/frida_inject.log " +
-                "$REMOTE_BRIDGE_SOCKET $REMOTE_LAST_INJECT_MARKER 2>/dev/null || true"
+                "$REMOTE_BRIDGE_SOCKET $REMOTE_LAST_INJECT_MARKER $REMOTE_INJECTING_MARKER 2>/dev/null || true"
         )
         log.onLog("  ✅ 已清理中间文件（保留 frida-server/frida-inject 二进制）")
 
