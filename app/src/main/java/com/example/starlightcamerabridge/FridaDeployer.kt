@@ -8,7 +8,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import org.tukaani.xz.XZInputStream
-import java.io.ByteArrayOutputStream
+import java.io.File
 import java.io.IOException
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -208,6 +208,10 @@ class FridaDeployer(private val appContext: Context) {
         const val ASSET_FRIDA_SERVER_XZ = "frida/frida-server.xz"
         const val ASSET_FRIDA_INJECT_XZ = "frida/frida-inject.xz"
         const val ASSET_HOOK_SCRIPT = "frida/stealth_camera_v3.js"
+        const val LOCAL_STAGE_DIR = "frida_stage"
+        const val LOCAL_STAGE_FRIDA_SERVER = "frida-server"
+        const val LOCAL_STAGE_FRIDA_INJECT = "frida-inject"
+        const val LOCAL_STAGE_HOOK_SCRIPT = "stealth_camera_v3.js"
 
         // 目标设备上的路径
         const val REMOTE_TMP = "/data/local/tmp"
@@ -278,28 +282,45 @@ class FridaDeployer(private val appContext: Context) {
     // ========== 解压 ==========
 
     /**
-     * 从 assets 读取 .xz 文件并解压为原始字节数组。
+     * 获取本地预处理目录（应用私有目录）。
      */
-    private suspend fun decompressXzAsset(assetPath: String): ByteArray = withContext(Dispatchers.IO) {
+    private suspend fun ensureLocalStageDir(): File = withContext(Dispatchers.IO) {
+        val dir = File(appContext.filesDir, LOCAL_STAGE_DIR)
+        if (!dir.exists() && !dir.mkdirs()) {
+            throw IOException("无法创建本地预处理目录: ${dir.absolutePath}")
+        }
+        dir
+    }
+
+    /**
+     * 从 assets 读取 .xz 文件并解压到应用本地文件。
+     */
+    private suspend fun decompressXzAssetToFile(assetPath: String, outputFile: File) = withContext(Dispatchers.IO) {
+        outputFile.parentFile?.mkdirs()
         appContext.assets.open(assetPath).use { raw ->
             XZInputStream(raw).use { xz ->
-                val buf = ByteArrayOutputStream(48 * 1024 * 1024) // 预分配 ~48MB
-                val tmp = ByteArray(65536)
-                while (true) {
-                    val n = xz.read(tmp)
-                    if (n < 0) break
-                    buf.write(tmp, 0, n)
+                outputFile.outputStream().use { out ->
+                    val buffer = ByteArray(64 * 1024)
+                    while (true) {
+                        val n = xz.read(buffer)
+                        if (n < 0) break
+                        out.write(buffer, 0, n)
+                    }
                 }
-                buf.toByteArray()
             }
         }
     }
 
     /**
-     * 从 assets 读取文件原始字节。
+     * 从 assets 读取原始文件并写入应用本地文件。
      */
-    private suspend fun readAssetBytes(assetPath: String): ByteArray = withContext(Dispatchers.IO) {
-        appContext.assets.open(assetPath).use { it.readBytes() }
+    private suspend fun copyAssetToFile(assetPath: String, outputFile: File) = withContext(Dispatchers.IO) {
+        outputFile.parentFile?.mkdirs()
+        appContext.assets.open(assetPath).use { input ->
+            outputFile.outputStream().use { out ->
+                input.copyTo(out)
+            }
+        }
     }
 
     // ========== 部署检测 ==========
@@ -321,11 +342,23 @@ class FridaDeployer(private val appContext: Context) {
     }
 
     /**
-     * 计算字节数组的 MD5 十六进制字符串（小写）。
+     * 计算文件的 MD5 十六进制字符串（小写）。
      */
-    private fun computeMd5(data: ByteArray): String {
+    private suspend fun computeFileMd5(file: File): String = withContext(Dispatchers.IO) {
         val digest = java.security.MessageDigest.getInstance("MD5")
-        return digest.digest(data).joinToString("") { "%02x".format(it) }
+        file.inputStream().use { input ->
+            val buffer = ByteArray(8 * 1024)
+            while (true) {
+                val n = input.read(buffer)
+                if (n < 0) break
+                if (n > 0) digest.update(buffer, 0, n)
+            }
+        }
+        digest.digest().joinToString("") { "%02x".format(it) }
+    }
+
+    private fun shellQuote(path: String): String {
+        return "'" + path.replace("'", "'\\''") + "'"
     }
 
     /**
@@ -351,42 +384,48 @@ class FridaDeployer(private val appContext: Context) {
     }
 
     /**
-     * 推送文件并循环重试，直到远端 MD5 与本地一致为止。
+     * 使用 adb shell cp 将应用本地文件复制到远端，并循环重试直到 MD5 一致。
      *
-     * @param data       待推送的字节数组
+     * @param localFile  应用本地已就绪文件
      * @param remotePath 远端目标路径
      * @param mode       文件权限（八进制整数，如 493 = 0755）
      * @param localMd5   本地预计算的 MD5
      * @param label      用于日志的显示名称
-     * @param onProgress 可选进度回调
      */
-    private suspend fun pushAndVerify(
+    private suspend fun copyLocalAndVerify(
         client: AdbClient,
-        data: ByteArray,
+        localFile: File,
         remotePath: String,
         mode: Int,
         localMd5: String,
         label: String,
-        log: LogCallback,
-        onProgress: ((sent: Int, total: Int) -> Unit)? = null
+        log: LogCallback
     ) {
+        val localPathQuoted = shellQuote(localFile.absolutePath)
+        val remotePathQuoted = shellQuote(remotePath)
+        val octalMode = String.format("%o", mode)
         for (attempt in 1..MAX_PUSH_VERIFY_RETRIES) {
-            if (attempt > 1) log.onLog("  🔄 第 ${attempt} 次推送 $label...")
-            client.pushFileViaShell(data, remotePath, mode = mode, onProgress = onProgress)
+            if (attempt > 1) log.onLog("  🔄 第 ${attempt} 次复制 $label...")
+            client.executeShellCommand(
+                "cp $localPathQuoted $remotePathQuoted 2>/dev/null " +
+                    "|| toybox cp $localPathQuoted $remotePathQuoted 2>/dev/null " +
+                    "|| busybox cp $localPathQuoted $remotePathQuoted 2>/dev/null"
+            )
+            client.executeShellCommand("chmod $octalMode $remotePathQuoted 2>/dev/null || true")
             val verifyMd5 = remoteFileMd5(client, remotePath)
             if (verifyMd5 == null) {
                 log.onLog("  ⚠️ 设备不支持 md5sum，跳过 MD5 校验（已完成推送）")
                 return
             }
             if (verifyMd5 == localMd5) {
-                log.onLog("  ✅ $label 推送完成，MD5 校验通过")
+                log.onLog("  ✅ $label 复制完成，MD5 校验通过")
                 return
             }
             if (attempt < MAX_PUSH_VERIFY_RETRIES) {
-                log.onLog("  ⚠️ $label MD5 校验失败（第 ${attempt} 次），重新推送...")
+                log.onLog("  ⚠️ $label MD5 校验失败（第 ${attempt} 次），重新复制...")
             }
         }
-        throw IOException("$label MD5 校验失败，已重试 $MAX_PUSH_VERIFY_RETRIES 次")
+        throw IOException("$label MD5 校验失败，已重试 $MAX_PUSH_VERIFY_RETRIES 次（cp 复制）")
     }
 
     /**
@@ -966,21 +1005,19 @@ class FridaDeployer(private val appContext: Context) {
                 val reason = if (remoteVersionCode.isEmpty()) "版本标记缺失" else "远端=$remoteVersionCode，当前=$currentVersionCode"
                 log.onLog("  ⚠️ 版本不一致（$reason），将重新推送所有文件")
             }
+            val localStageDir = ensureLocalStageDir()
 
             // frida-server
             val serverExists = remoteFileExists(client, REMOTE_FRIDA_SERVER)
             if (serverExists && versionMatch) {
                 log.onLog("  ✅ frida-server 已就绪（版本一致）")
             } else {
-                val serverData = decompressXzAsset(ASSET_FRIDA_SERVER_XZ)
-                val localServerMd5 = computeMd5(serverData)
-                if (!serverExists) log.onLog("  📤 推送 frida-server（文件缺失，${serverData.size / 1024 / 1024}MB）...")
-                else log.onLog("  📤 重新推送 frida-server（版本变更，${serverData.size / 1024 / 1024}MB）...")
-                pushAndVerify(client, serverData, REMOTE_FRIDA_SERVER, 493, localServerMd5, "frida-server", log) { sent, total ->
-                    if (sent % (5 * 1024 * 1024) < (total / 20).coerceAtLeast(1)) {
-                        Log.d(TAG, "push frida-server: $sent / $total")
-                    }
-                }
+                val localServerFile = File(localStageDir, LOCAL_STAGE_FRIDA_SERVER)
+                decompressXzAssetToFile(ASSET_FRIDA_SERVER_XZ, localServerFile)
+                val localServerMd5 = computeFileMd5(localServerFile)
+                if (!serverExists) log.onLog("  📤 复制 frida-server（文件缺失，${localServerFile.length() / 1024 / 1024}MB）...")
+                else log.onLog("  📤 重新复制 frida-server（版本变更，${localServerFile.length() / 1024 / 1024}MB）...")
+                copyLocalAndVerify(client, localServerFile, REMOTE_FRIDA_SERVER, 493, localServerMd5, "frida-server", log)
             }
 
             // frida-inject
@@ -988,23 +1025,25 @@ class FridaDeployer(private val appContext: Context) {
             if (injectExists && versionMatch) {
                 log.onLog("  ✅ frida-inject 已就绪（版本一致）")
             } else {
-                val injectData = decompressXzAsset(ASSET_FRIDA_INJECT_XZ)
-                val localInjectMd5 = computeMd5(injectData)
-                if (!injectExists) log.onLog("  📤 推送 frida-inject（文件缺失）...")
-                else log.onLog("  📤 重新推送 frida-inject（版本变更）...")
-                pushAndVerify(client, injectData, REMOTE_FRIDA_INJECT, 493, localInjectMd5, "frida-inject", log)
+                val localInjectFile = File(localStageDir, LOCAL_STAGE_FRIDA_INJECT)
+                decompressXzAssetToFile(ASSET_FRIDA_INJECT_XZ, localInjectFile)
+                val localInjectMd5 = computeFileMd5(localInjectFile)
+                if (!injectExists) log.onLog("  📤 复制 frida-inject（文件缺失）...")
+                else log.onLog("  📤 重新复制 frida-inject（版本变更）...")
+                copyLocalAndVerify(client, localInjectFile, REMOTE_FRIDA_INJECT, 493, localInjectMd5, "frida-inject", log)
             }
 
             // hook 脚本
-            val scriptData = readAssetBytes(ASSET_HOOK_SCRIPT)
-            val localScriptMd5 = computeMd5(scriptData)
+            val localScriptFile = File(localStageDir, LOCAL_STAGE_HOOK_SCRIPT)
+            copyAssetToFile(ASSET_HOOK_SCRIPT, localScriptFile)
+            val localScriptMd5 = computeFileMd5(localScriptFile)
             val scriptExists = remoteFileExists(client, REMOTE_HOOK_SCRIPT)
             if (scriptExists && versionMatch) {
                 log.onLog("  ✅ hook 脚本已就绪（版本一致）")
             } else {
-                if (!scriptExists) log.onLog("  📤 推送 hook 脚本（文件缺失）...")
-                else log.onLog("  📤 重新推送 hook 脚本（版本变更）...")
-                pushAndVerify(client, scriptData, REMOTE_HOOK_SCRIPT, 420, localScriptMd5, "hook 脚本", log)
+                if (!scriptExists) log.onLog("  📤 复制 hook 脚本（文件缺失）...")
+                else log.onLog("  📤 重新复制 hook 脚本（版本变更）...")
+                copyLocalAndVerify(client, localScriptFile, REMOTE_HOOK_SCRIPT, 420, localScriptMd5, "hook 脚本", log)
             }
 
             // 所有文件就绪后，更新远端版本标记
