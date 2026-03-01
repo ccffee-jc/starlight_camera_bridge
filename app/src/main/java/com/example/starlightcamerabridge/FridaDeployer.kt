@@ -9,6 +9,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import org.tukaani.xz.XZInputStream
 import java.io.ByteArrayOutputStream
+import java.io.IOException
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -216,6 +217,8 @@ class FridaDeployer(private val appContext: Context) {
         const val REMOTE_BRIDGE_SOCKET = "$REMOTE_TMP/starlight_bridge.sock"
         const val REMOTE_LAST_INJECT_MARKER = "$REMOTE_TMP/starlight_bridge_last_inject_ms"
         const val REMOTE_INJECTING_MARKER = "$REMOTE_TMP/starlight_bridge_injecting"
+        /** 远端部署版本标记文件，内容为推送时的 APK versionCode */
+        const val REMOTE_DEPLOY_VERSION = "$REMOTE_TMP/starlight_bridge_deploy.version"
 
         // 目标进程
         const val TARGET_PROCESS = "avm3d_service"
@@ -252,6 +255,9 @@ class FridaDeployer(private val appContext: Context) {
         // 重注入等待参数
         const val REINJECT_RESTART_WAIT_TIMEOUT_MS = 8000L
         const val REINJECT_RESTART_POLL_MS = 200L
+
+        // 推送文件后 MD5 校验最大重试次数
+        const val MAX_PUSH_VERIFY_RETRIES = 3
 
         // 目标进程轮询等待参数
         const val TARGET_PID_WAIT_POLL_MS = 200L
@@ -312,6 +318,75 @@ class FridaDeployer(private val appContext: Context) {
     private suspend fun remoteFileExecutable(client: AdbClient, path: String): Boolean {
         val out = client.executeShellCommand("test -x $path && echo YES || echo NO").trim()
         return out.contains("YES")
+    }
+
+    /**
+     * 计算字节数组的 MD5 十六进制字符串（小写）。
+     */
+    private fun computeMd5(data: ByteArray): String {
+        val digest = java.security.MessageDigest.getInstance("MD5")
+        return digest.digest(data).joinToString("") { "%02x".format(it) }
+    }
+
+    /**
+     * 获取远程文件的 MD5 值。
+     *
+     * @return MD5 十六进制字符串（32 位小写），文件不存在或命令不可用时返回 null
+     */
+    private suspend fun remoteFileMd5(client: AdbClient, path: String): String? {
+        val commands = listOf(
+            "md5sum $path 2>/dev/null",
+            "toybox md5sum $path 2>/dev/null",
+            "busybox md5sum $path 2>/dev/null"
+        )
+        for (command in commands) {
+            val out = client.executeShellCommand(command).trim()
+            // md5sum 输出格式：<hash>  <filename>
+            val hash = out.split("\\s+".toRegex()).firstOrNull()
+            if (hash != null && hash.length == 32 && hash.all { c -> c in '0'..'9' || c in 'a'..'f' }) {
+                return hash
+            }
+        }
+        return null
+    }
+
+    /**
+     * 推送文件并循环重试，直到远端 MD5 与本地一致为止。
+     *
+     * @param data       待推送的字节数组
+     * @param remotePath 远端目标路径
+     * @param mode       文件权限（八进制整数，如 493 = 0755）
+     * @param localMd5   本地预计算的 MD5
+     * @param label      用于日志的显示名称
+     * @param onProgress 可选进度回调
+     */
+    private suspend fun pushAndVerify(
+        client: AdbClient,
+        data: ByteArray,
+        remotePath: String,
+        mode: Int,
+        localMd5: String,
+        label: String,
+        log: LogCallback,
+        onProgress: ((sent: Int, total: Int) -> Unit)? = null
+    ) {
+        for (attempt in 1..MAX_PUSH_VERIFY_RETRIES) {
+            if (attempt > 1) log.onLog("  🔄 第 ${attempt} 次推送 $label...")
+            client.pushFileViaShell(data, remotePath, mode = mode, onProgress = onProgress)
+            val verifyMd5 = remoteFileMd5(client, remotePath)
+            if (verifyMd5 == null) {
+                log.onLog("  ⚠️ 设备不支持 md5sum，跳过 MD5 校验（已完成推送）")
+                return
+            }
+            if (verifyMd5 == localMd5) {
+                log.onLog("  ✅ $label 推送完成，MD5 校验通过")
+                return
+            }
+            if (attempt < MAX_PUSH_VERIFY_RETRIES) {
+                log.onLog("  ⚠️ $label MD5 校验失败（第 ${attempt} 次），重新推送...")
+            }
+        }
+        throw IOException("$label MD5 校验失败，已重试 $MAX_PUSH_VERIFY_RETRIES 次")
     }
 
     /**
@@ -868,40 +943,75 @@ class FridaDeployer(private val appContext: Context) {
                 }
             }
 
-            // 4. 逐文件检查 & 只推送缺失的文件
-            log.onLog("📦 检查远程文件...")
+            // 4. 逐文件检查 & 版本比对（APK versionCode 一致则跳过，不一致或文件缺失则推送+MD5重试）
+            log.onLog("📦 校验远程文件...")
+
+            // 读取当前 APK versionCode 及远端已部署的版本号
+            val currentVersionCode = try {
+                val pm = appContext.packageManager
+                val info = pm.getPackageInfo(appContext.packageName, 0)
+                @Suppress("DEPRECATION")
+                info.versionCode.toString()
+            } catch (e: Exception) {
+                Log.w(TAG, "getPackageInfo failed, fallback to '0'", e)
+                "0"
+            }
+            val remoteVersionCode = client.executeShellCommand(
+                "cat $REMOTE_DEPLOY_VERSION 2>/dev/null"
+            ).trim()
+            val versionMatch = remoteVersionCode == currentVersionCode
+            if (versionMatch) {
+                log.onLog("  ℹ️ 远端版本与当前 APK 一致（versionCode=$currentVersionCode），按需跳过")
+            } else {
+                val reason = if (remoteVersionCode.isEmpty()) "版本标记缺失" else "远端=$remoteVersionCode，当前=$currentVersionCode"
+                log.onLog("  ⚠️ 版本不一致（$reason），将重新推送所有文件")
+            }
 
             // frida-server
-            if (remoteFileExists(client, REMOTE_FRIDA_SERVER)) {
-                log.onLog("  ✅ frida-server 已存在，跳过")
+            val serverExists = remoteFileExists(client, REMOTE_FRIDA_SERVER)
+            if (serverExists && versionMatch) {
+                log.onLog("  ✅ frida-server 已就绪（版本一致）")
             } else {
-                log.onLog("  📤 解压 frida-server.xz (约50MB)...")
                 val serverData = decompressXzAsset(ASSET_FRIDA_SERVER_XZ)
-                log.onLog("  📤 推送 frida-server (${serverData.size / 1024 / 1024}MB)...")
-                client.pushFileViaShell(serverData, REMOTE_FRIDA_SERVER, mode = 493) { sent, total ->
+                val localServerMd5 = computeMd5(serverData)
+                if (!serverExists) log.onLog("  📤 推送 frida-server（文件缺失，${serverData.size / 1024 / 1024}MB）...")
+                else log.onLog("  📤 重新推送 frida-server（版本变更，${serverData.size / 1024 / 1024}MB）...")
+                pushAndVerify(client, serverData, REMOTE_FRIDA_SERVER, 493, localServerMd5, "frida-server", log) { sent, total ->
                     if (sent % (5 * 1024 * 1024) < (total / 20).coerceAtLeast(1)) {
                         Log.d(TAG, "push frida-server: $sent / $total")
                     }
                 }
-                log.onLog("  ✅ frida-server 已推送")
             }
 
             // frida-inject
-            if (remoteFileExists(client, REMOTE_FRIDA_INJECT)) {
-                log.onLog("  ✅ frida-inject 已存在，跳过")
+            val injectExists = remoteFileExists(client, REMOTE_FRIDA_INJECT)
+            if (injectExists && versionMatch) {
+                log.onLog("  ✅ frida-inject 已就绪（版本一致）")
             } else {
-                log.onLog("  📤 解压 frida-inject.xz...")
                 val injectData = decompressXzAsset(ASSET_FRIDA_INJECT_XZ)
-                log.onLog("  📤 推送 frida-inject (${injectData.size / 1024 / 1024}MB)...")
-                client.pushFileViaShell(injectData, REMOTE_FRIDA_INJECT, mode = 493)
-                log.onLog("  ✅ frida-inject 已推送")
+                val localInjectMd5 = computeMd5(injectData)
+                if (!injectExists) log.onLog("  📤 推送 frida-inject（文件缺失）...")
+                else log.onLog("  📤 重新推送 frida-inject（版本变更）...")
+                pushAndVerify(client, injectData, REMOTE_FRIDA_INJECT, 493, localInjectMd5, "frida-inject", log)
             }
 
-            // hook 脚本（较小，始终推送以确保最新）
-            log.onLog("  📤 推送 hook 脚本...")
+            // hook 脚本
             val scriptData = readAssetBytes(ASSET_HOOK_SCRIPT)
-            client.pushFileViaShell(scriptData, REMOTE_HOOK_SCRIPT, mode = 420) // 0644
-            log.onLog("  ✅ hook 脚本已推送")
+            val localScriptMd5 = computeMd5(scriptData)
+            val scriptExists = remoteFileExists(client, REMOTE_HOOK_SCRIPT)
+            if (scriptExists && versionMatch) {
+                log.onLog("  ✅ hook 脚本已就绪（版本一致）")
+            } else {
+                if (!scriptExists) log.onLog("  📤 推送 hook 脚本（文件缺失）...")
+                else log.onLog("  📤 重新推送 hook 脚本（版本变更）...")
+                pushAndVerify(client, scriptData, REMOTE_HOOK_SCRIPT, 420, localScriptMd5, "hook 脚本", log)
+            }
+
+            // 所有文件就绪后，更新远端版本标记
+            if (!versionMatch) {
+                client.executeShellCommand("printf '%s' '$currentVersionCode' > $REMOTE_DEPLOY_VERSION")
+                log.onLog("  📝 已更新远端版本标记（versionCode=$currentVersionCode）")
+            }
 
             // 确保权限正确
             client.executeShellCommand("chmod 755 $REMOTE_FRIDA_SERVER $REMOTE_FRIDA_INJECT")
@@ -1051,14 +1161,14 @@ class FridaDeployer(private val appContext: Context) {
      *
      * 操作步骤：
      * 1. 杀死目标进程 avm3d_service（等待系统保活拉起干净实例）
-     * 2. 保留 frida-server 运行状态（下次注入可直接复用）
-     * 3. 杀死 frida-inject
-     * 4. 清理中间文件（脚本、日志、socket、时间标记）
+     * 2. 杀死 frida-server 并删除其二进制文件
+     * 3. 杀死 frida-inject 并删除其二进制文件
+     * 4. 清理所有中间文件（脚本、日志、socket、时间标记）
      * 5. 清理本地注入时间标记
      * 6. 等待目标进程恢复
      */
     private suspend fun restoreInjectedState(client: AdbClient, log: LogCallback) {
-        log.onLog("🔄 正在还原：杀目标进程 + 清理中间文件（保留 frida-server）...")
+        log.onLog("🔄 正在还原：杀死所有相关进程并清理所有远端文件...")
 
         // 杀死目标进程
         val targetPids = client.executeShellCommand("pidof $TARGET_PROCESS 2>/dev/null").trim()
@@ -1069,8 +1179,14 @@ class FridaDeployer(private val appContext: Context) {
             log.onLog("  ℹ️ 目标进程 $TARGET_PROCESS 未运行")
         }
 
-        // 保留 frida-server
-        log.onLog("  ℹ️ 按当前策略保留 frida-server 运行状态")
+        // 杀死 frida-server
+        val serverPid = client.executeShellCommand("pidof frida-server 2>/dev/null").trim()
+        if (serverPid.isNotEmpty()) {
+            client.executeShellCommand("kill -9 $serverPid 2>/dev/null || true")
+            log.onLog("  ✅ 已杀死 frida-server (PID=$serverPid)")
+        } else {
+            log.onLog("  ℹ️ frida-server 未运行")
+        }
 
         // 杀死 frida-inject
         val injectPid = client.executeShellCommand("pidof frida-inject 2>/dev/null").trim()
@@ -1079,12 +1195,14 @@ class FridaDeployer(private val appContext: Context) {
             log.onLog("  ✅ 已杀死 frida-inject (PID=$injectPid)")
         }
 
-        // 清理中间文件（保留 frida-server/frida-inject 二进制）
+        // 删除所有远端文件（包括二进制及部署版本标记）
         client.executeShellCommand(
-            "rm -f $REMOTE_HOOK_SCRIPT $REMOTE_TMP/frida_inject.log " +
+            "rm -f $REMOTE_FRIDA_SERVER $REMOTE_FRIDA_INJECT " +
+                "$REMOTE_HOOK_SCRIPT $REMOTE_DEPLOY_VERSION " +
+                "$REMOTE_TMP/frida_inject.log " +
                 "$REMOTE_BRIDGE_SOCKET $REMOTE_LAST_INJECT_MARKER $REMOTE_INJECTING_MARKER 2>/dev/null || true"
         )
-        log.onLog("  ✅ 已清理中间文件（保留 frida-server/frida-inject 二进制）")
+        log.onLog("  ✅ 已删除所有远端文件（含 frida-server/frida-inject 二进制及部署版本标记）")
 
         // 清理本地注入时间标记
         FridaInjectTimestampPreferences.clear(appContext)

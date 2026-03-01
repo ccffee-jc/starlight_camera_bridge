@@ -39,6 +39,7 @@ class AdbClient(context: Context) {
         if (socket?.isConnected == true) return@withContext
         val sock = Socket()
         sock.tcpNoDelay = true
+        sock.keepAlive = true
         sock.connect(InetSocketAddress(host, port), CONNECT_TIMEOUT_MS)
         maxPayloadSize = AdbConstants.DEFAULT_MAX_PAYLOAD
         val io = AdbPacketIO(sock.getInputStream(), sock.getOutputStream())
@@ -149,9 +150,15 @@ class AdbClient(context: Context) {
         mode: Int = 493,
         onProgress: ((sent: Int, total: Int) -> Unit)? = null
     ): Unit = withContext(Dispatchers.IO) {
-        // 每块原始数据大小：131070 字节 (3 的倍数，base64 编码后 ~175KB，
-        // 加上 shell 命令开销 ~100B，远小于 maxPayload 256KB)
-        val rawChunkSize = 131070
+        // 动态计算安全块大小，确保 shell OPEN payload 永不超过协商的 maxPayloadSize。
+        // 预留固定命令开销和保护余量，剩余预算全部留给 base64 字符串。
+        val cmdFixed = "shell:printf '%s' '' | base64 -d >> ".toByteArray(Charsets.UTF_8).size +
+            remotePath.toByteArray(Charsets.UTF_8).size
+        val payloadSafetyMargin = 512
+        val payloadBudget = (maxPayloadSize - cmdFixed - payloadSafetyMargin).coerceAtLeast(4)
+        // base64 长度必须是 4 的倍数；raw 长度按 4:3 反推，至少 3 字节避免死循环。
+        val safeB64Chars = (payloadBudget / 4) * 4
+        val rawChunkSize = ((safeB64Chars / 4) * 3).coerceAtLeast(3)
 
         var offset = 0
         var first = true
