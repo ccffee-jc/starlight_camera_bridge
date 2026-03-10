@@ -18,7 +18,8 @@
 
         <receiver
             android:name=".FridaInjectReceiver"
-            android:exported="true">
+            android:exported="true"
+            android:directBootAware="true">
             <intent-filter>
                 <action android:name="com.example.starlightcamerabridge.ACTION_INJECT" />
                 <action android:name="com.example.starlightcamerabridge.ACTION_RESTORE" />
