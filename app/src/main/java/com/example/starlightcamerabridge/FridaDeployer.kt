@@ -218,6 +218,8 @@ class FridaDeployer(private val appContext: Context) {
         const val REMOTE_FRIDA_SERVER = "$REMOTE_TMP/frida-server"
         const val REMOTE_FRIDA_INJECT = "$REMOTE_TMP/frida-inject"
         const val REMOTE_HOOK_SCRIPT = "$REMOTE_TMP/stealth_camera_v3.js"
+        const val REMOTE_FRIDA_SERVER_LOG = "$REMOTE_TMP/frida_server.log"
+        const val REMOTE_FRIDA_INJECT_LOG = "$REMOTE_TMP/frida_inject.log"
         const val REMOTE_BRIDGE_SOCKET = "$REMOTE_TMP/starlight_bridge.sock"
         const val REMOTE_LAST_INJECT_MARKER = "$REMOTE_TMP/starlight_bridge_last_inject_ms"
         const val REMOTE_INJECTING_MARKER = "$REMOTE_TMP/starlight_bridge_injecting"
@@ -1077,7 +1079,10 @@ class FridaDeployer(private val appContext: Context) {
             // 6. 启动 frida-server（如果未运行）
             if (!isFridaServerRunning(client)) {
                 log.onLog("🚀 启动 frida-server...")
-                client.executeShellCommand("$REMOTE_FRIDA_SERVER -l 0.0.0.0 -D")
+                client.executeShellCommand(
+                    "echo ==== frida-server start ts=\\$(date +%s%3N) ==== >> $REMOTE_FRIDA_SERVER_LOG; " +
+                        "$REMOTE_FRIDA_SERVER -l 0.0.0.0 -D >> $REMOTE_FRIDA_SERVER_LOG 2>&1"
+                )
                 delay(2000)
                 if (isFridaServerRunning(client)) {
                     log.onLog("✅ frida-server 已启动")
@@ -1108,13 +1113,14 @@ class FridaDeployer(private val appContext: Context) {
             }
             log.onLog("💉 使用 frida-inject 注入到 PID=$freshPid...")
             val injectOutput = client.executeShellCommand(
-                "$REMOTE_FRIDA_INJECT -p $freshPid -s $REMOTE_HOOK_SCRIPT -e " +
-                    "> $REMOTE_TMP/frida_inject.log 2>&1; echo __RC:\$?"
+                "echo ==== frida-inject start ts=\\$(date +%s%3N) pid=$freshPid ==== >> $REMOTE_FRIDA_INJECT_LOG; " +
+                    "$REMOTE_FRIDA_INJECT -p $freshPid -s $REMOTE_HOOK_SCRIPT -e " +
+                    ">> $REMOTE_FRIDA_INJECT_LOG 2>&1; echo __RC:\$?"
             )
             delay(1000)
 
             // 9. 验证注入结果
-            val injectLog = client.executeShellCommand("cat $REMOTE_TMP/frida_inject.log 2>/dev/null").trim()
+            val injectLog = client.executeShellCommand("tail -c 131072 $REMOTE_FRIDA_INJECT_LOG 2>/dev/null").trim()
             if (injectLog.isNotEmpty()) {
                 log.onLog("📋 frida-inject 输出:\n$injectLog")
             }
@@ -1238,7 +1244,6 @@ class FridaDeployer(private val appContext: Context) {
         client.executeShellCommand(
             "rm -f $REMOTE_FRIDA_SERVER $REMOTE_FRIDA_INJECT " +
                 "$REMOTE_HOOK_SCRIPT $REMOTE_DEPLOY_VERSION " +
-                "$REMOTE_TMP/frida_inject.log " +
                 "$REMOTE_BRIDGE_SOCKET $REMOTE_LAST_INJECT_MARKER $REMOTE_INJECTING_MARKER 2>/dev/null || true"
         )
         log.onLog("  ✅ 已删除所有远端文件（含 frida-server/frida-inject 二进制及部署版本标记）")
