@@ -36,6 +36,27 @@ internal data class DuplicateInjectDecision(
     val reason: String
 )
 
+internal data class InjectEntryDecision(
+    val shouldSkipBecauseSocketReady: Boolean,
+    val shouldBypassDuplicateWindow: Boolean
+)
+
+internal fun decideInjectEntry(
+    strictRestart: Boolean,
+    bridgeSocketReady: Boolean
+): InjectEntryDecision {
+    if (bridgeSocketReady && !strictRestart) {
+        return InjectEntryDecision(
+            shouldSkipBecauseSocketReady = true,
+            shouldBypassDuplicateWindow = false
+        )
+    }
+    return InjectEntryDecision(
+        shouldSkipBecauseSocketReady = false,
+        shouldBypassDuplicateWindow = strictRestart
+    )
+}
+
 internal fun decideDuplicateInjection(
     lastInjectAtMs: Long,
     nowMs: Long,
@@ -631,9 +652,10 @@ class FridaDeployer(private val appContext: Context) {
     private suspend fun restartTargetProcessForReinject(
         client: AdbClient,
         oldPid: String,
-        log: LogCallback
+        log: LogCallback,
+        reasonLabel: String = "重复注入"
     ): String? {
-        log.onLog("🔁 重复注入：先重启目标进程 $TARGET_PROCESS (PID=$oldPid)")
+        log.onLog("🔁 $reasonLabel：先重启目标进程 $TARGET_PROCESS (PID=$oldPid)")
         client.executeShellCommand("kill -9 $oldPid 2>/dev/null || true")
 
         log.onLog("⏳ 等待目标进程拉起（最多 ${REINJECT_RESTART_WAIT_TIMEOUT_MS / 1000}s）...")
@@ -647,6 +669,55 @@ class FridaDeployer(private val appContext: Context) {
         }
         log.onLog("⚠️ 目标进程重启等待超时，仍未拿到新 PID")
         return null
+    }
+
+    private suspend fun killProcessByName(
+        client: AdbClient,
+        processName: String,
+        displayName: String,
+        log: LogCallback
+    ) {
+        val pids = client.executeShellCommand("pidof $processName 2>/dev/null").trim()
+        if (pids.isEmpty()) {
+            log.onLog("  ℹ️ $displayName 未运行")
+            return
+        }
+        client.executeShellCommand("kill -9 $pids 2>/dev/null || true")
+        log.onLog("  ✅ 已杀死 $displayName (PID=$pids)")
+    }
+
+    private suspend fun clearRuntimeStateWithoutRemovingFiles(
+        client: AdbClient,
+        log: LogCallback
+    ) {
+        client.executeShellCommand(
+            "rm -f $REMOTE_BRIDGE_SOCKET $REMOTE_LAST_INJECT_MARKER $REMOTE_INJECTING_MARKER 2>/dev/null || true"
+        )
+        FridaInjectTimestampPreferences.clear(appContext)
+        log.onLog("  🧹 已清理 bridge socket 与注入标记（保留二进制/脚本/日志）")
+    }
+
+    private suspend fun prepareStrictReinject(
+        client: AdbClient,
+        currentPid: String,
+        log: LogCallback
+    ): String? {
+        log.onLog("🔒 严格重启重注入：清理目标进程与 Frida 运行态，但保留部署文件")
+        killProcessByName(client, "frida-server", "frida-server", log)
+        killProcessByName(client, "frida-inject", "frida-inject", log)
+        clearRuntimeStateWithoutRemovingFiles(client, log)
+        val restartedPid = restartTargetProcessForReinject(
+            client = client,
+            oldPid = currentPid,
+            log = log,
+            reasonLabel = "严格重启重注入"
+        )
+        if (restartedPid.isNullOrBlank()) {
+            log.onLog("❌ 严格重启后未等到 $TARGET_PROCESS 被系统重新拉起")
+            return null
+        }
+        log.onLog("✅ 严格重启后目标进程已重新拉起，新 PID=$restartedPid")
+        return restartedPid
     }
 
     /**
@@ -903,7 +974,12 @@ class FridaDeployer(private val appContext: Context) {
      * @param port ADB 端口
      * @param log 日志回调
      */
-    suspend fun inject(host: String, port: Int, log: LogCallback) {
+    suspend fun inject(
+        host: String,
+        port: Int,
+        log: LogCallback,
+        strictRestart: Boolean = false
+    ) {
         if (!injectOperationRunning.compareAndSet(false, true)) {
             log.onLog("⚠️ 已有注入流程执行中（含目标进程轮询），跳过重复注入请求")
             return
@@ -932,21 +1008,33 @@ class FridaDeployer(private val appContext: Context) {
                 explainMissingTargetProcess(client, log)
                 return
             }
+            var currentPid = pid
             if (pidLookup.source == "ps_fallback") {
-                log.onLog("✅ 通过 ps 回退找到目标进程 PID=$pid（pidof 未命中）")
+                log.onLog("✅ 通过 ps 回退找到目标进程 PID=$currentPid（pidof 未命中）")
             } else {
-                log.onLog("✅ 找到目标进程 PID=$pid")
+                log.onLog("✅ 找到目标进程 PID=$currentPid")
             }
 
             val bridgeSocketReady = isBridgeSocketReady(client)
-            if (bridgeSocketReady) {
+            val entryDecision = decideInjectEntry(
+                strictRestart = strictRestart,
+                bridgeSocketReady = bridgeSocketReady
+            )
+            if (entryDecision.shouldSkipBecauseSocketReady) {
                 log.onLog("✅ bridge socket 已就绪，跳过重复注入")
                 val injectAtMs = System.currentTimeMillis()
                 FridaInjectTimestampPreferences.setLastInjectAtMs(appContext, injectAtMs)
-                FridaInjectTimestampPreferences.setLastInjectPid(appContext, pid)
+                FridaInjectTimestampPreferences.setLastInjectPid(appContext, currentPid)
                 syncLastInjectMarker(client, injectAtMs)
                 log.onLog("🕒 已刷新注入时间标记")
                 return
+            }
+            if (strictRestart) {
+                log.onLog("ℹ️ 本次注入启用 strict_restart，跳过 bridge ready / 重复注入短路")
+                currentPid = prepareStrictReinject(client, currentPid, log) ?: run {
+                    explainMissingTargetProcess(client, log)
+                    return
+                }
             }
 
             // 3. 基于时间戳的重复注入检测
@@ -954,14 +1042,19 @@ class FridaDeployer(private val appContext: Context) {
             val lastInjectAtMs = FridaInjectTimestampPreferences.getLastInjectAtMs(appContext)
             val lastInjectPid = FridaInjectTimestampPreferences.getLastInjectPid(appContext)
 
-            if (lastInjectAtMs > 0) {
+            if (entryDecision.shouldBypassDuplicateWindow) {
+                if (lastInjectAtMs > 0) {
+                    val elapsed = (nowMs - lastInjectAtMs).coerceAtLeast(0)
+                    log.onLog("ℹ️ strict_restart 已绕过 60 秒重复注入窗口（距离上次 ${elapsed / 1000}s）")
+                }
+            } else if (lastInjectAtMs > 0) {
                 val elapsed = (nowMs - lastInjectAtMs).coerceAtLeast(0)
                 val duplicateDecision = decideDuplicateInjection(
                     lastInjectAtMs = lastInjectAtMs,
                     nowMs = nowMs,
                     bridgeSocketReady = bridgeSocketReady,
                     lastInjectPid = lastInjectPid,
-                    currentPid = pid
+                    currentPid = currentPid
                 )
                 if (duplicateDecision.shouldSkip) {
                     log.onLog("⚠️ 检测到重复注入触发，距离上次注入仅 ${elapsed / 1000}s")
@@ -972,7 +1065,7 @@ class FridaDeployer(private val appContext: Context) {
                     "pid_changed" -> {
                         log.onLog(
                             "ℹ️ 距离上次注入 ${elapsed / 1000}s，但目标 PID 已变化 " +
-                                "($lastInjectPid -> $pid)，忽略 60 秒窗口强制重注入"
+                                "($lastInjectPid -> $currentPid)，忽略 60 秒窗口强制重注入"
                         )
                     }
                     "socket_missing" -> {
@@ -1215,30 +1308,9 @@ class FridaDeployer(private val appContext: Context) {
     private suspend fun restoreInjectedState(client: AdbClient, log: LogCallback) {
         log.onLog("🔄 正在还原：杀死所有相关进程并清理所有远端文件...")
 
-        // 杀死目标进程
-        val targetPids = client.executeShellCommand("pidof $TARGET_PROCESS 2>/dev/null").trim()
-        if (targetPids.isNotEmpty()) {
-            client.executeShellCommand("kill -9 $targetPids 2>/dev/null || true")
-            log.onLog("  ✅ 已杀死目标进程 $TARGET_PROCESS (PID=$targetPids)")
-        } else {
-            log.onLog("  ℹ️ 目标进程 $TARGET_PROCESS 未运行")
-        }
-
-        // 杀死 frida-server
-        val serverPid = client.executeShellCommand("pidof frida-server 2>/dev/null").trim()
-        if (serverPid.isNotEmpty()) {
-            client.executeShellCommand("kill -9 $serverPid 2>/dev/null || true")
-            log.onLog("  ✅ 已杀死 frida-server (PID=$serverPid)")
-        } else {
-            log.onLog("  ℹ️ frida-server 未运行")
-        }
-
-        // 杀死 frida-inject
-        val injectPid = client.executeShellCommand("pidof frida-inject 2>/dev/null").trim()
-        if (injectPid.isNotEmpty()) {
-            client.executeShellCommand("kill -9 $injectPid 2>/dev/null || true")
-            log.onLog("  ✅ 已杀死 frida-inject (PID=$injectPid)")
-        }
+        killProcessByName(client, TARGET_PROCESS, "目标进程 $TARGET_PROCESS", log)
+        killProcessByName(client, "frida-server", "frida-server", log)
+        killProcessByName(client, "frida-inject", "frida-inject", log)
 
         // 删除所有远端文件（包括二进制及部署版本标记）
         client.executeShellCommand(

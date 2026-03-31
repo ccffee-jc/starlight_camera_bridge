@@ -32,6 +32,28 @@ class FridaDeployerPolicyTest {
     }
 
     @Test
+    fun decideInjectEntry_skipsReadySocketOnlyWhenNotStrict() {
+        val decision = decideInjectEntry(
+            strictRestart = false,
+            bridgeSocketReady = true
+        )
+
+        assertTrue(decision.shouldSkipBecauseSocketReady)
+        assertFalse(decision.shouldBypassDuplicateWindow)
+    }
+
+    @Test
+    fun decideInjectEntry_bypassesShortCircuitWhenStrictRestartEnabled() {
+        val decision = decideInjectEntry(
+            strictRestart = true,
+            bridgeSocketReady = true
+        )
+
+        assertFalse(decision.shouldSkipBecauseSocketReady)
+        assertTrue(decision.shouldBypassDuplicateWindow)
+    }
+
+    @Test
     fun decideDuplicateInjection_shouldForceWhenSocketMissingInsideWindow() {
         val decision = decideDuplicateInjection(
             lastInjectAtMs = 1_000L,

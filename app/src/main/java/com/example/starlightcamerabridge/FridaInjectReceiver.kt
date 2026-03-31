@@ -24,6 +24,7 @@ class FridaInjectReceiver : BroadcastReceiver() {
         private const val TAG = "FridaInjectReceiver"
         const val ACTION_INJECT = "com.example.starlightcamerabridge.ACTION_INJECT"
         const val ACTION_RESTORE = "com.example.starlightcamerabridge.ACTION_RESTORE"
+        const val EXTRA_STRICT_RESTART = "strict_restart"
         private val operationRunning = AtomicBoolean(false)
     }
 
@@ -38,8 +39,9 @@ class FridaInjectReceiver : BroadcastReceiver() {
             ?: AdbConnectionPreferences.getHost(appContext)
         val port = intent.getStringExtra("port")?.toIntOrNull()
             ?: AdbConnectionPreferences.getPort(appContext)
+        val strictRestart = intent.getBooleanExtra(EXTRA_STRICT_RESTART, false)
 
-        Log.i(TAG, "使用连接: $host:$port")
+        Log.i(TAG, "使用连接: $host:$port strictRestart=$strictRestart")
 
         val deployer = FridaDeployer(appContext)
         val logCallback = FridaDeployer.LogCallback { msg ->
@@ -55,7 +57,7 @@ class FridaInjectReceiver : BroadcastReceiver() {
                     }
                     Log.i(TAG, "===== 开始注入 =====")
                     try {
-                        deployer.inject(host, port, logCallback)
+                        deployer.inject(host, port, logCallback, strictRestart = strictRestart)
                     } finally {
                         operationRunning.set(false)
                         Log.i(TAG, "===== 注入流程结束 =====")

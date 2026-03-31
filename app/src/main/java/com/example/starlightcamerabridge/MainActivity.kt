@@ -142,10 +142,14 @@ class MainActivity : ComponentActivity() {
             tvFridaLog.text = ""
 
             lifecycleScope.launch(Dispatchers.Main) {
-                fridaDeployer.inject(hp.first, hp.second) { msg ->
-                    // 回调可能在 IO 线程，切到主线程
-                    launch(Dispatchers.Main) { appendFridaLog(msg) }
-                }
+                fridaDeployer.inject(
+                    host = hp.first,
+                    port = hp.second,
+                    log = { msg ->
+                        // 回调可能在 IO 线程，切到主线程
+                        launch(Dispatchers.Main) { appendFridaLog(msg) }
+                    }
+                )
                 btnFridaInject.isEnabled = true
                 btnFridaRestore.isEnabled = true
             }
