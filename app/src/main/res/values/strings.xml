@@ -25,6 +25,9 @@
     <string name="frida_section_title">Frida 注入</string>
     <string name="frida_btn_inject">开始注入</string>
     <string name="frida_btn_restore">恢复程序</string>
+    <string name="frida_target_fps_label">Bridge 目标帧率</string>
+    <string name="frida_target_fps_hint">例如 15 或 12</string>
+    <string name="frida_target_fps_invalid">请输入有效的目标帧率</string>
     <string name="frida_log_label">注入日志</string>
     <string name="frida_log_idle">等待操作…</string>
 </resources>

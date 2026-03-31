@@ -2,7 +2,9 @@ package com.example.starlightcamerabridge
 
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 
 class FridaDeployerPolicyTest {
@@ -191,5 +193,71 @@ class FridaDeployerPolicyTest {
         assertEquals("line1\nline2", result.output)
         assertEquals(7, result.exitCode)
         assertFalse(result.markerMissing)
+    }
+
+    @Test
+    fun assessFridaInjectResult_allowsPositiveLogWithoutExitMarker() {
+        val result = assessFridaInjectResult(
+            rawOutput = "[?] shell channel closed early",
+            injectLog = """
+                [?] memfd NF ready
+                [?] stealth_camera_v3 loaded. Waiting for camera activation...
+            """.trimIndent()
+        )
+
+        assertNull(result.exitCode)
+        assertTrue(result.markerMissing)
+        assertTrue(result.positiveSignalDetected)
+        assertFalse(result.fatalSignalDetected)
+        assertTrue(result.canProceedToActivation)
+    }
+
+    @Test
+    fun assessFridaInjectResult_rejectsFatalInjectLog() {
+        val result = assessFridaInjectResult(
+            rawOutput = "__RC:1",
+            injectLog = "Failed to inject: permission denied"
+        )
+
+        assertEquals(1, result.exitCode)
+        assertFalse(result.markerMissing)
+        assertFalse(result.positiveSignalDetected)
+        assertTrue(result.fatalSignalDetected)
+        assertFalse(result.canProceedToActivation)
+    }
+
+    @Test
+    fun normalizeBridgeTargetFps_shouldClampAndFallback() {
+        assertEquals(DEFAULT_BRIDGE_TARGET_FPS, normalizeBridgeTargetFps(Double.NaN), 0.0)
+        assertEquals(5.0, normalizeBridgeTargetFps(1.0), 0.0)
+        assertEquals(30.0, normalizeBridgeTargetFps(60.0), 0.0)
+        assertEquals(12.5, normalizeBridgeTargetFps(12.5), 0.0)
+    }
+
+    @Test
+    fun computeBridgeFrameIntervalMs_shouldUseCeiling() {
+        assertEquals(100, computeBridgeFrameIntervalMs(10.0))
+        assertEquals(42, computeBridgeFrameIntervalMs(24.0))
+        assertEquals(67, computeBridgeFrameIntervalMs(15.0))
+    }
+
+    @Test
+    fun renderHookScriptTemplate_shouldReplaceTargetFpsAndInterval() {
+        val rendered = renderHookScriptTemplate(
+            "var targetFps = __TARGET_FPS__, minIntervalMs = __MIN_INTERVAL_MS__;",
+            12.5
+        )
+
+        assertEquals("var targetFps = 12.5, minIntervalMs = 80;", rendered)
+    }
+
+    @Test
+    fun renderHookScriptTemplate_shouldFailWhenPlaceholderMissing() {
+        try {
+            renderHookScriptTemplate("var targetFps = __TARGET_FPS__;", 10.0)
+            fail("expected placeholder validation failure")
+        } catch (expected: IllegalArgumentException) {
+            assertTrue(expected.message?.contains("__MIN_INTERVAL_MS__") == true)
+        }
     }
 }

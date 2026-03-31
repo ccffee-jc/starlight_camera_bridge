@@ -168,7 +168,7 @@ var frameWidth = 0, frameHeight = 0, frameFmt = 0;
 var wireWidth = 0, wireHeight = 0;
 var frameCount = 0, skippedCount = 0, sentCount = 0;
 var lastWriteTs = 0, lastLogTs = 0, startTs = Date.now();
-var targetFps = 20, minIntervalMs = 50;
+var targetFps = __TARGET_FPS__, minIntervalMs = __MIN_INTERVAL_MS__;
 var FORCE_OUTPUT_RES = false;
 var OUTPUT_WIDTH = 2560;
 var OUTPUT_HEIGHT = 1920;

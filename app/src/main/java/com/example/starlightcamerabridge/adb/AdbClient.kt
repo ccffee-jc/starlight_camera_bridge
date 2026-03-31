@@ -67,6 +67,59 @@ class AdbClient(context: Context) {
     }
 
     /**
+     * 打开 Shell 长连接，用于前台托管长生命周期命令。
+     */
+    suspend fun openShellStream(command: String): AdbShellStream = withContext(Dispatchers.IO) {
+        val rootCommand = AdbRootShell.wrapIfEnabled(appContext, command)
+        val io = packetIO ?: throw IllegalStateException("ADB not connected")
+        val localId = localIdCounter.getAndIncrement()
+        val serviceString = "shell:${rootCommand.raw}\u0000"
+        io.send(
+            command = AdbConstants.COMMAND_OPEN,
+            arg0 = localId,
+            arg1 = 0,
+            payload = serviceString.toByteArray(Charsets.UTF_8),
+        )
+
+        var remoteId = -1
+        val initialChunks = mutableListOf<String>()
+        while (remoteId < 0) {
+            val message = io.read()
+            when (message.command) {
+                AdbConstants.COMMAND_OKAY -> {
+                    if (message.arg1 == localId) {
+                        remoteId = message.arg0
+                    }
+                }
+                AdbConstants.COMMAND_WRTE -> {
+                    if (message.arg1 != localId) continue
+                    val text = String(message.payload, Charsets.UTF_8)
+                    if (text.isNotEmpty()) {
+                        initialChunks.add(text)
+                    }
+                    io.send(
+                        command = AdbConstants.COMMAND_OKAY,
+                        arg0 = localId,
+                        arg1 = message.arg0,
+                    )
+                }
+                AdbConstants.COMMAND_CLSE -> {
+                    if (message.arg1 != localId) continue
+                    io.send(
+                        command = AdbConstants.COMMAND_CLSE,
+                        arg0 = localId,
+                        arg1 = message.arg0,
+                    )
+                    throw IOException("Shell stream closed before ready")
+                }
+                AdbConstants.COMMAND_AUTH -> respondToAuth(io, message, allowPublicKey = false)
+                else -> throw IOException("Unexpected command during shell open: ${message.command.toCommandString()}")
+            }
+        }
+        AdbShellStream(io, this@AdbClient, localId, remoteId, initialChunks)
+    }
+
+    /**
      * 通过 ADB sync 协议将文件推送到远程设备。
      *
      * @param data 文件原始字节数据
@@ -344,7 +397,7 @@ class AdbClient(context: Context) {
         return output.toString()
     }
 
-    private fun respondToAuth(io: AdbPacketIO, message: AdbMessage, allowPublicKey: Boolean): Boolean {
+    internal fun respondToAuth(io: AdbPacketIO, message: AdbMessage, allowPublicKey: Boolean): Boolean {
         if (message.arg0 != AdbConstants.AUTH_TOKEN) return false
         val signature = keyStore.signToken(message.payload)
         io.send(

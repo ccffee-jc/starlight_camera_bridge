@@ -25,10 +25,18 @@ class FridaInjectReceiver : BroadcastReceiver() {
         const val ACTION_INJECT = "com.example.starlightcamerabridge.ACTION_INJECT"
         const val ACTION_RESTORE = "com.example.starlightcamerabridge.ACTION_RESTORE"
         const val EXTRA_STRICT_RESTART = "strict_restart"
+        const val EXTRA_TARGET_FPS = "target_fps"
+        private const val INVALID_TARGET_FPS = Double.NaN
         private val operationRunning = AtomicBoolean(false)
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    private fun resolveTargetFps(intent: Intent, context: Context): Double {
+        val parsed = intent.getStringExtra(EXTRA_TARGET_FPS)?.toDoubleOrNull()
+            ?: intent.getDoubleExtra(EXTRA_TARGET_FPS, INVALID_TARGET_FPS).takeIf { it.isFinite() }
+        return parsed ?: BridgeTargetFpsPreferences.load(context)
+    }
 
     override fun onReceive(context: Context, intent: Intent) {
         val action = intent.action ?: return
@@ -40,8 +48,10 @@ class FridaInjectReceiver : BroadcastReceiver() {
         val port = intent.getStringExtra("port")?.toIntOrNull()
             ?: AdbConnectionPreferences.getPort(appContext)
         val strictRestart = intent.getBooleanExtra(EXTRA_STRICT_RESTART, false)
+        val targetFps = resolveTargetFps(intent, appContext)
+        BridgeTargetFpsPreferences.save(appContext, targetFps)
 
-        Log.i(TAG, "使用连接: $host:$port strictRestart=$strictRestart")
+        Log.i(TAG, "使用连接: $host:$port strictRestart=$strictRestart targetFps=$targetFps")
 
         val deployer = FridaDeployer(appContext)
         val logCallback = FridaDeployer.LogCallback { msg ->
@@ -57,7 +67,13 @@ class FridaInjectReceiver : BroadcastReceiver() {
                     }
                     Log.i(TAG, "===== 开始注入 =====")
                     try {
-                        deployer.inject(host, port, logCallback, strictRestart = strictRestart)
+                        deployer.inject(
+                            host = host,
+                            port = port,
+                            log = logCallback,
+                            strictRestart = strictRestart,
+                            targetFps = targetFps
+                        )
                     } finally {
                         operationRunning.set(false)
                         Log.i(TAG, "===== 注入流程结束 =====")

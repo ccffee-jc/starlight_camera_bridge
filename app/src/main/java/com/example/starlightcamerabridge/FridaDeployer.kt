@@ -4,19 +4,74 @@ import android.content.Context
 import android.util.Log
 import com.example.starlightcamerabridge.adb.AdbClient
 import com.example.starlightcamerabridge.adb.AdbRootShell
+import com.example.starlightcamerabridge.adb.AdbShellStream
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.tukaani.xz.XZInputStream
 import java.io.File
 import java.io.IOException
+import java.text.DecimalFormat
+import java.text.DecimalFormatSymbols
+import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.ceil
 
 /**
  * 重复注入跳过窗口（毫秒）。
  * 距离上次成功注入在此窗口内的新注入请求将被直接跳过。
  */
 internal const val DUPLICATE_INJECT_SKIP_WINDOW_MS = 60000L
+internal const val DEFAULT_BRIDGE_TARGET_FPS = 15.0
+private const val MIN_BRIDGE_TARGET_FPS = 5.0
+private const val MAX_BRIDGE_TARGET_FPS = 30.0
+private const val HOOK_SCRIPT_TARGET_FPS_PLACEHOLDER = "__TARGET_FPS__"
+private const val HOOK_SCRIPT_MIN_INTERVAL_MS_PLACEHOLDER = "__MIN_INTERVAL_MS__"
+
+private val HOOK_TARGET_FPS_FORMAT = DecimalFormat(
+    "0.##",
+    DecimalFormatSymbols(Locale.US)
+)
+
+internal fun normalizeBridgeTargetFps(targetFps: Double): Double {
+    if (!targetFps.isFinite()) return DEFAULT_BRIDGE_TARGET_FPS
+    return targetFps.coerceIn(MIN_BRIDGE_TARGET_FPS, MAX_BRIDGE_TARGET_FPS)
+}
+
+internal fun computeBridgeFrameIntervalMs(targetFps: Double): Int {
+    val normalizedTargetFps = normalizeBridgeTargetFps(targetFps)
+    return maxOf(ceil(1000.0 / normalizedTargetFps).toInt(), 1)
+}
+
+internal fun formatBridgeTargetFps(targetFps: Double): String {
+    return HOOK_TARGET_FPS_FORMAT.format(normalizeBridgeTargetFps(targetFps))
+}
+
+internal fun renderHookScriptTemplate(template: String, targetFps: Double): String {
+    require(template.contains(HOOK_SCRIPT_TARGET_FPS_PLACEHOLDER)) {
+        "hook 脚本模板缺少 $HOOK_SCRIPT_TARGET_FPS_PLACEHOLDER"
+    }
+    require(template.contains(HOOK_SCRIPT_MIN_INTERVAL_MS_PLACEHOLDER)) {
+        "hook 脚本模板缺少 $HOOK_SCRIPT_MIN_INTERVAL_MS_PLACEHOLDER"
+    }
+    val normalizedTargetFps = normalizeBridgeTargetFps(targetFps)
+    val rendered = template
+        .replace(HOOK_SCRIPT_TARGET_FPS_PLACEHOLDER, formatBridgeTargetFps(normalizedTargetFps))
+        .replace(
+            HOOK_SCRIPT_MIN_INTERVAL_MS_PLACEHOLDER,
+            computeBridgeFrameIntervalMs(normalizedTargetFps).toString()
+        )
+    check(!rendered.contains(HOOK_SCRIPT_TARGET_FPS_PLACEHOLDER)) {
+        "hook 脚本模板中的 $HOOK_SCRIPT_TARGET_FPS_PLACEHOLDER 未替换完成"
+    }
+    check(!rendered.contains(HOOK_SCRIPT_MIN_INTERVAL_MS_PLACEHOLDER)) {
+        "hook 脚本模板中的 $HOOK_SCRIPT_MIN_INTERVAL_MS_PLACEHOLDER 未替换完成"
+    }
+    return rendered
+}
 
 /**
  * 判断是否应跳过本次重复注入。
@@ -138,6 +193,14 @@ internal data class ShellProbeResult(
     val markerMissing: Boolean
 )
 
+internal data class FridaInjectAssessment(
+    val exitCode: Int?,
+    val markerMissing: Boolean,
+    val positiveSignalDetected: Boolean,
+    val fatalSignalDetected: Boolean,
+    val canProceedToActivation: Boolean
+)
+
 internal fun parseShellProbeResult(rawOutput: String, marker: String = "__HA_RC__:"): ShellProbeResult {
     val lines = rawOutput.lineSequence().toList()
     val markerLine = lines.lastOrNull { it.trim().startsWith(marker) }
@@ -154,6 +217,46 @@ internal fun parseShellProbeResult(rawOutput: String, marker: String = "__HA_RC_
         output = outputLines.joinToString("\n").trim(),
         exitCode = exitCode,
         markerMissing = false
+    )
+}
+
+internal fun assessFridaInjectResult(
+    rawOutput: String,
+    injectLog: String,
+    marker: String = "__RC:"
+): FridaInjectAssessment {
+    val probe = parseShellProbeResult(rawOutput, marker = marker)
+    val positiveKeywords = listOf(
+        "memfd NF ready",
+        "stealth_camera_v3 loaded",
+        "Waiting for camera activation",
+        "switch_avm hooked",
+        "setAppState + stop hooked"
+    )
+    val fatalKeywords = listOf(
+        "not found",
+        "No such file",
+        "Permission denied",
+        "Exec format error",
+        "unable to connect",
+        "failed to inject",
+        "failed to attach",
+        "failed to spawn",
+        "process not found"
+    )
+    val positiveSignalDetected = positiveKeywords.any { injectLog.contains(it, ignoreCase = true) }
+    val fatalSignalDetected = fatalKeywords.any { injectLog.contains(it, ignoreCase = true) }
+    val canProceedToActivation = when {
+        probe.exitCode == 0 && !fatalSignalDetected -> true
+        probe.markerMissing && positiveSignalDetected && !fatalSignalDetected -> true
+        else -> false
+    }
+    return FridaInjectAssessment(
+        exitCode = probe.exitCode,
+        markerMissing = probe.markerMissing,
+        positiveSignalDetected = positiveSignalDetected,
+        fatalSignalDetected = fatalSignalDetected,
+        canProceedToActivation = canProceedToActivation
     )
 }
 
@@ -346,6 +449,17 @@ class FridaDeployer(private val appContext: Context) {
         }
     }
 
+    private suspend fun renderHookScriptToFile(
+        assetPath: String,
+        outputFile: File,
+        targetFps: Double
+    ) = withContext(Dispatchers.IO) {
+        outputFile.parentFile?.mkdirs()
+        val template = appContext.assets.open(assetPath).bufferedReader(Charsets.UTF_8).use { it.readText() }
+        val rendered = renderHookScriptTemplate(template, targetFps)
+        outputFile.writeText(rendered, Charsets.UTF_8)
+    }
+
     // ========== 部署检测 ==========
 
     /**
@@ -455,8 +569,40 @@ class FridaDeployer(private val appContext: Context) {
      * 检测 frida-server 是否正在运行。
      */
     private suspend fun isFridaServerRunning(client: AdbClient): Boolean {
-        val out = client.executeShellCommand("pidof frida-server 2>/dev/null").trim()
-        return out.isNotEmpty()
+        val out = client.executeShellCommand(
+            "ps -A 2>/dev/null | grep -F 'frida-server' | grep -v grep || true"
+        ).trim()
+        return parsePidFromPsLine(out, "frida-server") != null
+    }
+
+    private suspend fun waitForFridaServerRunning(
+        client: AdbClient,
+        timeoutMs: Long = 3_000L,
+        pollMs: Long = 200L
+    ): Boolean {
+        val startAt = System.currentTimeMillis()
+        while (true) {
+            if (isFridaServerRunning(client)) return true
+            val elapsed = (System.currentTimeMillis() - startAt).coerceAtLeast(0)
+            if (elapsed >= timeoutMs) return false
+            delay(pollMs)
+        }
+    }
+
+    private suspend fun readRemoteLogTail(
+        client: AdbClient,
+        path: String,
+        maxBytes: Int = 32768
+    ): String {
+        return client.executeShellCommand("tail -c $maxBytes $path 2>/dev/null").trim()
+    }
+
+    private fun appendTruncated(builder: StringBuilder, chunk: String, maxChars: Int = 8192) {
+        if (chunk.isEmpty()) return
+        builder.append(chunk)
+        if (builder.length > maxChars) {
+            builder.delete(0, builder.length - maxChars)
+        }
     }
 
     /**
@@ -978,19 +1124,28 @@ class FridaDeployer(private val appContext: Context) {
         host: String,
         port: Int,
         log: LogCallback,
-        strictRestart: Boolean = false
+        strictRestart: Boolean = false,
+        targetFps: Double = DEFAULT_BRIDGE_TARGET_FPS
     ) {
         if (!injectOperationRunning.compareAndSet(false, true)) {
             log.onLog("⚠️ 已有注入流程执行中（含目标进程轮询），跳过重复注入请求")
             return
         }
         val client = AdbClient(appContext)
+        var fridaServerClient: AdbClient? = null
+        var fridaServerStream: AdbShellStream? = null
+        var fridaServerStreamJob: Job? = null
+        val fridaServerStreamOutput = StringBuilder()
         var retainInjectingMarker = false
+        val normalizedTargetFps = normalizeBridgeTargetFps(targetFps)
+        val formattedTargetFps = formatBridgeTargetFps(normalizedTargetFps)
+        val minIntervalMs = computeBridgeFrameIntervalMs(normalizedTargetFps)
         try {
             // 1. 连接
             log.onLog("⏳ 连接 ADB ($host:$port)...")
             client.connect(host, port)
             log.onLog("✅ ADB 已连接")
+            log.onLog("🎯 本次 bridge 采集节流 targetFps=$formattedTargetFps minIntervalMs=$minIntervalMs")
             markInjectingInProgress(client)
             log.onLog("ℹ️ 已写入注入中标记")
 
@@ -1130,14 +1285,19 @@ class FridaDeployer(private val appContext: Context) {
 
             // hook 脚本
             val localScriptFile = File(localStageDir, LOCAL_STAGE_HOOK_SCRIPT)
-            copyAssetToFile(ASSET_HOOK_SCRIPT, localScriptFile)
+            renderHookScriptToFile(ASSET_HOOK_SCRIPT, localScriptFile, normalizedTargetFps)
             val localScriptMd5 = computeFileMd5(localScriptFile)
             val scriptExists = remoteFileExists(client, REMOTE_HOOK_SCRIPT)
-            if (scriptExists && versionMatch) {
-                log.onLog("  ✅ hook 脚本已就绪（版本一致）")
+            val remoteScriptMd5 = if (scriptExists) remoteFileMd5(client, REMOTE_HOOK_SCRIPT) else null
+            val scriptUpToDate = scriptExists && remoteScriptMd5 == localScriptMd5
+            if (scriptUpToDate) {
+                log.onLog("  ✅ hook 脚本已就绪（targetFps=$formattedTargetFps）")
             } else {
-                if (!scriptExists) log.onLog("  📤 复制 hook 脚本（文件缺失）...")
-                else log.onLog("  📤 重新复制 hook 脚本（版本变更）...")
+                if (!scriptExists) {
+                    log.onLog("  📤 复制 hook 脚本（文件缺失，targetFps=$formattedTargetFps）...")
+                } else {
+                    log.onLog("  📤 重新复制 hook 脚本（内容变化，targetFps=$formattedTargetFps）...")
+                }
                 copyLocalAndVerify(client, localScriptFile, REMOTE_HOOK_SCRIPT, 420, localScriptMd5, "hook 脚本", log)
             }
 
@@ -1171,16 +1331,41 @@ class FridaDeployer(private val appContext: Context) {
 
             // 6. 启动 frida-server（如果未运行）
             if (!isFridaServerRunning(client)) {
-                log.onLog("🚀 启动 frida-server...")
-                client.executeShellCommand(
-                    "echo ==== frida-server start ts=\\$(date +%s%3N) ==== >> $REMOTE_FRIDA_SERVER_LOG; " +
-                        "$REMOTE_FRIDA_SERVER -l 0.0.0.0 -D >> $REMOTE_FRIDA_SERVER_LOG 2>&1"
-                )
-                delay(2000)
-                if (isFridaServerRunning(client)) {
-                    log.onLog("✅ frida-server 已启动")
+                log.onLog("🚀 启动 frida-server（托管模式）...")
+                fridaServerClient = AdbClient(appContext).also { managedClient ->
+                    managedClient.connect(host, port)
+                    fridaServerStream = managedClient.openShellStream(
+                        "echo ==== frida-server start ts=\$(date +%s%3N) ==== >> $REMOTE_FRIDA_SERVER_LOG; " +
+                            "exec $REMOTE_FRIDA_SERVER -l 0.0.0.0 >> $REMOTE_FRIDA_SERVER_LOG 2>&1"
+                    )
+                    val stream = checkNotNull(fridaServerStream)
+                    fridaServerStreamJob = CoroutineScope(Dispatchers.IO).launch {
+                        runCatching {
+                            stream.readLoop { chunk ->
+                                synchronized(fridaServerStreamOutput) {
+                                    appendTruncated(fridaServerStreamOutput, chunk)
+                                }
+                            }
+                        }.onFailure { streamError ->
+                            Log.w(TAG, "frida-server managed shell stream ended", streamError)
+                        }
+                    }
+                }
+                if (waitForFridaServerRunning(client)) {
+                    log.onLog("✅ frida-server 已启动（前台托管中）")
                 } else {
-                    log.onLog("⚠️ frida-server 可能未正常启动，继续尝试注入...")
+                    log.onLog("❌ frida-server 启动失败，停止后续注入")
+                    val serverLog = readRemoteLogTail(client, REMOTE_FRIDA_SERVER_LOG)
+                    if (serverLog.isNotBlank()) {
+                        log.onLog("📋 frida-server 日志:\n${truncateForUi(serverLog)}")
+                    }
+                    val streamOutput = synchronized(fridaServerStreamOutput) {
+                        fridaServerStreamOutput.toString().trim()
+                    }
+                    if (streamOutput.isNotBlank()) {
+                        log.onLog("📋 托管 shell 输出:\n${truncateForUi(streamOutput)}")
+                    }
+                    return
                 }
             } else {
                 log.onLog("✅ frida-server 已在运行")
@@ -1206,7 +1391,7 @@ class FridaDeployer(private val appContext: Context) {
             }
             log.onLog("💉 使用 frida-inject 注入到 PID=$freshPid...")
             val injectOutput = client.executeShellCommand(
-                "echo ==== frida-inject start ts=\\$(date +%s%3N) pid=$freshPid ==== >> $REMOTE_FRIDA_INJECT_LOG; " +
+                "echo ==== frida-inject start ts=\$(date +%s%3N) pid=$freshPid ==== >> $REMOTE_FRIDA_INJECT_LOG; " +
                     "$REMOTE_FRIDA_INJECT -p $freshPid -s $REMOTE_HOOK_SCRIPT -e " +
                     ">> $REMOTE_FRIDA_INJECT_LOG 2>&1; echo __RC:\$?"
             )
@@ -1218,18 +1403,20 @@ class FridaDeployer(private val appContext: Context) {
                 log.onLog("📋 frida-inject 输出:\n$injectLog")
             }
 
-            // 解析退出码
-            val rcLine = injectOutput.lineSequence().firstOrNull { it.contains("__RC:") }
-            val exitCode = rcLine ?: ""
-            val isRcZero = exitCode.contains("__RC:0")
-            val errorKeywords = listOf(
-                "not found", "No such file", "Permission denied",
-                "Exec format error", "unable to connect", "failed"
-            )
-            val hasError = errorKeywords.any { injectLog.contains(it, ignoreCase = true) }
+            val injectAssessment = assessFridaInjectResult(injectOutput, injectLog, marker = "__RC:")
+            if (injectAssessment.markerMissing) {
+                log.onLog("⚠️ frida-inject 退出码标记缺失，将结合脚本加载信号与 bridge 就绪情况继续判定")
+            }
+            if (injectAssessment.positiveSignalDetected) {
+                log.onLog("ℹ️ 已检测到脚本加载正向信号，继续触发 AVM 激活并等待 bridge socket")
+            }
 
-            if (isRcZero && !hasError) {
-                log.onLog("✅ 注入完成（eternalize 模式，脚本已常驻目标进程）")
+            if (injectAssessment.canProceedToActivation) {
+                if (injectAssessment.exitCode == 0) {
+                    log.onLog("✅ 注入完成（eternalize 模式，脚本已常驻目标进程）")
+                } else {
+                    log.onLog("✅ 注入命令未返回可靠退出码，但日志显示脚本已驻留，继续验证 bridge 就绪")
+                }
 
                 // 10. 优先激活一次 360，再等待 bridge 就绪
                 activateAvmViaActivity(client, log)
@@ -1249,8 +1436,11 @@ class FridaDeployer(private val appContext: Context) {
                     log.onLog("⚠️ bridge socket 仍未就绪，跳过收口并暂不写入注入时间标记，允许哨兵快速重试")
                 }
             } else {
-                val displayExit = exitCode.ifBlank { "unknown" }
+                val displayExit = injectAssessment.exitCode?.toString() ?: "unknown"
                 log.onLog("❌ 注入失败（exit=$displayExit）")
+                if (injectAssessment.markerMissing) {
+                    log.onLog("⚠️ 注入失败时未解析到退出码标记")
+                }
                 return
             }
 
@@ -1260,6 +1450,9 @@ class FridaDeployer(private val appContext: Context) {
             Log.e(TAG, "inject failed", e)
             log.onLog("❌ 错误: ${e.message}")
         } finally {
+            runCatching { fridaServerStream?.close() }
+            fridaServerStreamJob?.cancel()
+            runCatching { fridaServerClient?.close() }
             if (!retainInjectingMarker) {
                 runCatching { clearInjectingInProgressMarker(client) }
             }

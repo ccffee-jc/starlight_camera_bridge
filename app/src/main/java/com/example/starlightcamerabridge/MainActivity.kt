@@ -24,6 +24,7 @@ class MainActivity : ComponentActivity() {
 
         val inputAdbHost = findViewById<TextInputEditText>(R.id.inputAdbHost)
         val inputAdbPort = findViewById<TextInputEditText>(R.id.inputAdbPort)
+        val inputBridgeTargetFps = findViewById<TextInputEditText>(R.id.inputBridgeTargetFps)
         val inputAdbCommand = findViewById<TextInputEditText>(R.id.inputAdbCommand)
         val btnExecute = findViewById<MaterialButton>(R.id.btnExecute)
         val tvOutput = findViewById<TextView>(R.id.tvOutput)
@@ -35,6 +36,7 @@ class MainActivity : ComponentActivity() {
 
         inputAdbHost.setText(AdbConnectionPreferences.getHost(this))
         inputAdbPort.setText(AdbConnectionPreferences.getPort(this).toString())
+        inputBridgeTargetFps.setText(formatBridgeTargetFps(BridgeTargetFpsPreferences.load(this)))
 
         val btnSaveConnection = findViewById<MaterialButton>(R.id.btnSaveConnection)
         btnSaveConnection.setOnClickListener {
@@ -137,6 +139,14 @@ class MainActivity : ComponentActivity() {
 
         btnFridaInject.setOnClickListener {
             val hp = readHostPort() ?: return@setOnClickListener
+            val targetFps = inputBridgeTargetFps.text?.toString()?.trim()?.toDoubleOrNull()
+            if (targetFps == null || !targetFps.isFinite() || targetFps <= 0.0) {
+                toast(getString(R.string.frida_target_fps_invalid))
+                return@setOnClickListener
+            }
+            val normalizedTargetFps = normalizeBridgeTargetFps(targetFps)
+            BridgeTargetFpsPreferences.save(this, normalizedTargetFps)
+            inputBridgeTargetFps.setText(formatBridgeTargetFps(normalizedTargetFps))
             btnFridaInject.isEnabled = false
             btnFridaRestore.isEnabled = false
             tvFridaLog.text = ""
@@ -145,6 +155,7 @@ class MainActivity : ComponentActivity() {
                 fridaDeployer.inject(
                     host = hp.first,
                     port = hp.second,
+                    targetFps = normalizedTargetFps,
                     log = { msg ->
                         // 回调可能在 IO 线程，切到主线程
                         launch(Dispatchers.Main) { appendFridaLog(msg) }
