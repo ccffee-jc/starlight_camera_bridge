@@ -44,8 +44,20 @@ Process.setExceptionHandler(function(details) {
     return false;
 });
 
+var MODE_FOREGROUND = 0;
+var MODE_BACKGROUND_BRIDGE = 1;
+var MODE_RECOVERING = 2;
+
+var BACKGROUND_BYPASS_COPY = __BACKGROUND_BYPASS_COPY__;
+var BACKGROUND_BYPASS_RENDER = __BACKGROUND_BYPASS_RENDER__;
+var BACKGROUND_FORCE_RENDER_LOOP = __BACKGROUND_FORCE_RENDER_LOOP__;
+var RECOVER_FRAME_COUNT = __RECOVER_FRAME_COUNT__;
+
 var stealthMode = false, gAvmInoutStatusAddr = null;
+var bridgeMode = MODE_FOREGROUND;
+var recoverFramesRemaining = 0;
 var blockCount = 0, allowCount = 0, hookDisabled = false, errorCount = 0;
+var backgroundCopyBypassCount = 0, backgroundRenderBypassCount = 0;
 function log(msg) { console.log(msg); }
 function findModule(name) {
     var mod = null;
@@ -64,6 +76,40 @@ function safeHookError(tag, e) {
     }
 }
 
+function modeName(mode) {
+    if (mode === MODE_BACKGROUND_BRIDGE) return "background_bridge";
+    if (mode === MODE_RECOVERING) return "recovering";
+    return "foreground";
+}
+
+function setBridgeMode(nextMode, reason) {
+    if (bridgeMode === nextMode) return;
+    bridgeMode = nextMode;
+    fileLog("[MODE] -> " + modeName(nextMode) + (reason ? " reason=" + reason : ""));
+}
+
+function enterForegroundRecover(reason) {
+    recoverFramesRemaining = RECOVER_FRAME_COUNT;
+    if (recoverFramesRemaining > 0) {
+        setBridgeMode(MODE_RECOVERING, reason);
+    } else {
+        setBridgeMode(MODE_FOREGROUND, reason);
+    }
+}
+
+function consumeRecoverFrame() {
+    if (bridgeMode !== MODE_RECOVERING) return;
+    if (recoverFramesRemaining > 0) recoverFramesRemaining--;
+    if (recoverFramesRemaining <= 0) {
+        recoverFramesRemaining = 0;
+        setBridgeMode(MODE_FOREGROUND, "recover_frames_done");
+    }
+}
+
+function isBackgroundBridgeMode() {
+    return bridgeMode === MODE_BACKGROUND_BRIDGE;
+}
+
 // ==================== STEALTH HOOKS ====================
 var GHIDRA_BASE = 0x100000;
 var glMod = findModule("libtest-opengl-swapinterval");
@@ -77,11 +123,18 @@ if (glMod) {
                 var state = args[0].toInt32();
                 if (state === 0) {
                     if (!stealthMode) { stealthMode = true; blockCount++; }
-                    this._needWriteback = true;
+                    setBridgeMode(MODE_BACKGROUND_BRIDGE, "switch_avm_hide");
+                    this._needWriteback = BACKGROUND_FORCE_RENDER_LOOP;
                 } else if (state === -1) {
-                    blockCount++; args[0] = ptr(3); this._needWriteback = false;
+                    blockCount++;
+                    args[0] = ptr(3);
+                    setBridgeMode(MODE_BACKGROUND_BRIDGE, "switch_avm_stop_to_background");
+                    this._needWriteback = false;
                 } else {
-                    if (state === 1 || state === 2) { if (stealthMode) stealthMode = false; }
+                    if (state === 1 || state === 2 || state === 3) {
+                        if (stealthMode) stealthMode = false;
+                        enterForegroundRecover("switch_avm_show_" + state);
+                    }
                     allowCount++; this._needWriteback = false;
                 }
             } catch(e) { safeHookError("switch_avm", e); }
@@ -113,6 +166,7 @@ if (camMod) {
     Interceptor.attach(camMod.base.add(0x193b8), { onEnter: function(args) { if (hookDisabled) return; } });
     log("[✓] setAppState + stop hooked");
 }
+var avmFunctionMod = findModule("libmtkavmfunction");
 
 // ==================== MEMFD NativeFunction ====================
 var _memfd_create = null, _ftruncate = null, _mmap = null;
@@ -349,6 +403,7 @@ var AImage_getFormat = new NativeFunction(ex["AImage_getFormat"], "int", ["point
 var AImage_getPlaneData        = new NativeFunction(ex["AImage_getPlaneData"],        "int", ["pointer", "int", "pointer", "pointer"]);
 var AImage_getPlaneRowStride   = new NativeFunction(ex["AImage_getPlaneRowStride"],   "int", ["pointer", "int", "pointer"]);
 var AImage_getPlanePixelStride = new NativeFunction(ex["AImage_getPlanePixelStride"], "int", ["pointer", "int", "pointer"]);
+var AImage_delete = new NativeFunction(ex["AImage_delete"], "void", ["pointer"]);
 
 var _planeBufs = [];
 for (var _i = 0; _i < 3; _i++) {
@@ -364,6 +419,90 @@ function getPlane(imgPtr, i) {
     AImage_getPlanePixelStride(imgPtr, i, b.ps);
     return { ptr: b.dp.readPointer(), len: b.dl.readS32(), row: b.rs.readS32(), pix: b.ps.readS32() };
 }
+
+var _origOnImageAvailable = null;
+var _origRenderWindow = null;
+var _backgroundOnImageBypassInstalled = false;
+var _backgroundRenderBypassInstalled = false;
+
+function installBackgroundOnImageBypass() {
+    if (_backgroundOnImageBypassInstalled || !BACKGROUND_BYPASS_COPY) return;
+    if (!camMod) camMod = findModule("libavmcamera");
+    if (!camMod) return;
+    if (typeof Interceptor.replaceFast !== "function") {
+        log("[!] replaceFast unavailable, skip native copy bypass");
+        return;
+    }
+    try {
+        var onImageAvailableAddr = camMod.base.add(0x19580);
+        var originalPtr = Interceptor.replaceFast(
+            onImageAvailableAddr,
+            new NativeCallback(function(ctx, imageReader) {
+                if (hookDisabled || !isBackgroundBridgeMode()) {
+                    _origOnImageAvailable(ctx, imageReader);
+                    return;
+                }
+                try {
+                    if (!ctx.isNull()) {
+                        var appState = ctx.add(8).readS32();
+                        if (appState === 0 || appState === -1) ctx.add(8).writeS32(3);
+                    }
+                    var imageHolder = Memory.alloc(Process.pointerSize);
+                    imageHolder.writePointer(ptr(0));
+                    var rc = AImageReader_acquireLatestImage(imageReader, imageHolder);
+                    if (rc === 0) {
+                        var imagePtr = imageHolder.readPointer();
+                        if (!imagePtr.isNull()) AImage_delete(imagePtr);
+                    }
+                    backgroundCopyBypassCount++;
+                } catch (e) {
+                    safeHookError("background_on_image_bypass", e);
+                    _origOnImageAvailable(ctx, imageReader);
+                }
+            }, "void", ["pointer", "pointer"])
+        );
+        _origOnImageAvailable = new NativeFunction(originalPtr, "void", ["pointer", "pointer"]);
+        _backgroundOnImageBypassInstalled = true;
+        log("[✓] background native copy bypass hooked");
+    } catch (e) {
+        safeHookError("install_background_on_image_bypass", e);
+    }
+}
+
+function installBackgroundRenderBypass() {
+    if (_backgroundRenderBypassInstalled || !BACKGROUND_BYPASS_RENDER) return;
+    if (!avmFunctionMod) avmFunctionMod = findModule("libmtkavmfunction");
+    if (!avmFunctionMod) return;
+    if (typeof Interceptor.replaceFast !== "function") {
+        log("[!] replaceFast unavailable, skip render bypass");
+        return;
+    }
+    try {
+        var renderWindowAddr = avmFunctionMod.base.add(0x43e20);
+        var originalPtr = Interceptor.replaceFast(
+            renderWindowAddr,
+            new NativeCallback(function(self, frameGroup, windowPtr, renderParams) {
+                if (hookDisabled || !isBackgroundBridgeMode()) {
+                    return _origRenderWindow(self, frameGroup, windowPtr, renderParams);
+                }
+                backgroundRenderBypassCount++;
+                return 0;
+            }, "uint64", ["pointer", "pointer", "pointer", "pointer"])
+        );
+        _origRenderWindow = new NativeFunction(
+            originalPtr,
+            "uint64",
+            ["pointer", "pointer", "pointer", "pointer"]
+        );
+        _backgroundRenderBypassInstalled = true;
+        log("[✓] background render bypass hooked");
+    } catch (e) {
+        safeHookError("install_background_render_bypass", e);
+    }
+}
+
+installBackgroundOnImageBypass();
+installBackgroundRenderBypass();
 
 // 帧索引发送缓冲区（重用，预分配）
 var _idxBuf = Memory.alloc(1);
@@ -402,6 +541,7 @@ Interceptor.attach(ex["AImageReader_acquireLatestImage"], {
                 if (!p2.ptr.isNull() && p2.len > 0) _memcpy(base.add(planeLenY + planeLenU), p2.ptr, p2.len);
             }
             frameCount++;
+            consumeRecoverFrame();
 
             // 发送帧索引给客户端（非阻塞）
             if (clientReady && _clientFd >= 0) {
@@ -428,7 +568,10 @@ Interceptor.attach(ex["AImageReader_acquireLatestImage"], {
                 log("[STATS] captured=" + frameCount + " sent=" + sentCount +
                     " skipped=" + skippedCount + " errors=" + errorCount +
                     " fps=" + (e > 0 ? (frameCount / e).toFixed(2) : "0") +
-                    " client=" + (clientReady ? "yes" : "no"));
+                    " client=" + (clientReady ? "yes" : "no") +
+                    " mode=" + modeName(bridgeMode) +
+                    " bypassCopy=" + backgroundCopyBypassCount +
+                    " bypassRender=" + backgroundRenderBypassCount);
                 lastLogTs = now;
             }
         } catch(e) { safeHookError("acq", e); }
@@ -444,9 +587,17 @@ setInterval(function() {
 }, 500);
 
 setInterval(function() {
+    if (!_backgroundOnImageBypassInstalled) installBackgroundOnImageBypass();
+    if (!_backgroundRenderBypassInstalled) installBackgroundRenderBypass();
+}, 1000);
+
+setInterval(function() {
     var status = gAvmInoutStatusAddr ? gAvmInoutStatusAddr.readS32() : "N/A";
     log("[STATUS] block:" + blockCount + " allow:" + allowCount + " status=" + status +
-        " stealth=" + stealthMode + " client=" + (clientReady ? "connected" : "none"));
+        " stealth=" + stealthMode + " client=" + (clientReady ? "connected" : "none") +
+        " mode=" + modeName(bridgeMode) + " recover=" + recoverFramesRemaining +
+        " bypassCopy=" + backgroundCopyBypassCount +
+        " bypassRender=" + backgroundRenderBypassCount);
 }, 60000);
 
 log("[✓] stealth_camera_v3 loaded. Waiting for camera activation...");

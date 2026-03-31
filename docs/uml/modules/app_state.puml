@@ -1,0 +1,21 @@
+@startuml
+' UML-SYNC-META-BEGIN
+' module: app
+' last_sync_utc: 2026-03-31T13:06:51Z
+' reason: changed
+' source: uml-sync
+' UML-SYNC-META-END
+hide empty description
+title 模块状态机：app
+[*] --> Init
+Init --> Active : 初始化完成
+Active --> Changed : 检测到代码变更
+Changed --> Active : 状态与说明已同步
+Active --> [*] : 模块停止
+
+note right of Active
+  补充中文说明：
+  1) 保留代码变量名用于对照
+  2) 增加关键状态与转移解释
+end note
+@enduml

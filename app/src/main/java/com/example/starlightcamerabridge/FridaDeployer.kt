@@ -30,6 +30,19 @@ private const val MIN_BRIDGE_TARGET_FPS = 5.0
 private const val MAX_BRIDGE_TARGET_FPS = 30.0
 private const val HOOK_SCRIPT_TARGET_FPS_PLACEHOLDER = "__TARGET_FPS__"
 private const val HOOK_SCRIPT_MIN_INTERVAL_MS_PLACEHOLDER = "__MIN_INTERVAL_MS__"
+private const val HOOK_SCRIPT_BACKGROUND_BYPASS_COPY_PLACEHOLDER = "__BACKGROUND_BYPASS_COPY__"
+private const val HOOK_SCRIPT_BACKGROUND_BYPASS_RENDER_PLACEHOLDER = "__BACKGROUND_BYPASS_RENDER__"
+private const val HOOK_SCRIPT_BACKGROUND_FORCE_RENDER_LOOP_PLACEHOLDER = "__BACKGROUND_FORCE_RENDER_LOOP__"
+private const val HOOK_SCRIPT_RECOVER_FRAME_COUNT_PLACEHOLDER = "__RECOVER_FRAME_COUNT__"
+private const val DEFAULT_BACKGROUND_RECOVER_FRAME_COUNT = 3
+
+internal data class HookScriptRuntimeConfig(
+    val targetFps: Double,
+    val backgroundBypassCopy: Boolean = true,
+    val backgroundBypassRender: Boolean = true,
+    val backgroundForceRenderLoop: Boolean = false,
+    val recoverFrameCount: Int = DEFAULT_BACKGROUND_RECOVER_FRAME_COUNT
+)
 
 private val HOOK_TARGET_FPS_FORMAT = DecimalFormat(
     "0.##",
@@ -51,24 +64,63 @@ internal fun formatBridgeTargetFps(targetFps: Double): String {
 }
 
 internal fun renderHookScriptTemplate(template: String, targetFps: Double): String {
+    return renderHookScriptTemplate(
+        template = template,
+        config = HookScriptRuntimeConfig(targetFps = targetFps)
+    )
+}
+
+internal fun renderHookScriptTemplate(template: String, config: HookScriptRuntimeConfig): String {
     require(template.contains(HOOK_SCRIPT_TARGET_FPS_PLACEHOLDER)) {
         "hook 脚本模板缺少 $HOOK_SCRIPT_TARGET_FPS_PLACEHOLDER"
     }
     require(template.contains(HOOK_SCRIPT_MIN_INTERVAL_MS_PLACEHOLDER)) {
         "hook 脚本模板缺少 $HOOK_SCRIPT_MIN_INTERVAL_MS_PLACEHOLDER"
     }
-    val normalizedTargetFps = normalizeBridgeTargetFps(targetFps)
+    require(template.contains(HOOK_SCRIPT_BACKGROUND_BYPASS_COPY_PLACEHOLDER)) {
+        "hook 脚本模板缺少 $HOOK_SCRIPT_BACKGROUND_BYPASS_COPY_PLACEHOLDER"
+    }
+    require(template.contains(HOOK_SCRIPT_BACKGROUND_BYPASS_RENDER_PLACEHOLDER)) {
+        "hook 脚本模板缺少 $HOOK_SCRIPT_BACKGROUND_BYPASS_RENDER_PLACEHOLDER"
+    }
+    require(template.contains(HOOK_SCRIPT_BACKGROUND_FORCE_RENDER_LOOP_PLACEHOLDER)) {
+        "hook 脚本模板缺少 $HOOK_SCRIPT_BACKGROUND_FORCE_RENDER_LOOP_PLACEHOLDER"
+    }
+    require(template.contains(HOOK_SCRIPT_RECOVER_FRAME_COUNT_PLACEHOLDER)) {
+        "hook 脚本模板缺少 $HOOK_SCRIPT_RECOVER_FRAME_COUNT_PLACEHOLDER"
+    }
+    val normalizedTargetFps = normalizeBridgeTargetFps(config.targetFps)
+    val normalizedRecoverFrameCount = config.recoverFrameCount.coerceAtLeast(0)
     val rendered = template
         .replace(HOOK_SCRIPT_TARGET_FPS_PLACEHOLDER, formatBridgeTargetFps(normalizedTargetFps))
         .replace(
             HOOK_SCRIPT_MIN_INTERVAL_MS_PLACEHOLDER,
             computeBridgeFrameIntervalMs(normalizedTargetFps).toString()
         )
+        .replace(HOOK_SCRIPT_BACKGROUND_BYPASS_COPY_PLACEHOLDER, config.backgroundBypassCopy.toString())
+        .replace(HOOK_SCRIPT_BACKGROUND_BYPASS_RENDER_PLACEHOLDER, config.backgroundBypassRender.toString())
+        .replace(
+            HOOK_SCRIPT_BACKGROUND_FORCE_RENDER_LOOP_PLACEHOLDER,
+            config.backgroundForceRenderLoop.toString()
+        )
+        .replace(HOOK_SCRIPT_RECOVER_FRAME_COUNT_PLACEHOLDER, normalizedRecoverFrameCount.toString())
     check(!rendered.contains(HOOK_SCRIPT_TARGET_FPS_PLACEHOLDER)) {
         "hook 脚本模板中的 $HOOK_SCRIPT_TARGET_FPS_PLACEHOLDER 未替换完成"
     }
     check(!rendered.contains(HOOK_SCRIPT_MIN_INTERVAL_MS_PLACEHOLDER)) {
         "hook 脚本模板中的 $HOOK_SCRIPT_MIN_INTERVAL_MS_PLACEHOLDER 未替换完成"
+    }
+    check(!rendered.contains(HOOK_SCRIPT_BACKGROUND_BYPASS_COPY_PLACEHOLDER)) {
+        "hook 脚本模板中的 $HOOK_SCRIPT_BACKGROUND_BYPASS_COPY_PLACEHOLDER 未替换完成"
+    }
+    check(!rendered.contains(HOOK_SCRIPT_BACKGROUND_BYPASS_RENDER_PLACEHOLDER)) {
+        "hook 脚本模板中的 $HOOK_SCRIPT_BACKGROUND_BYPASS_RENDER_PLACEHOLDER 未替换完成"
+    }
+    check(!rendered.contains(HOOK_SCRIPT_BACKGROUND_FORCE_RENDER_LOOP_PLACEHOLDER)) {
+        "hook 脚本模板中的 $HOOK_SCRIPT_BACKGROUND_FORCE_RENDER_LOOP_PLACEHOLDER 未替换完成"
+    }
+    check(!rendered.contains(HOOK_SCRIPT_RECOVER_FRAME_COUNT_PLACEHOLDER)) {
+        "hook 脚本模板中的 $HOOK_SCRIPT_RECOVER_FRAME_COUNT_PLACEHOLDER 未替换完成"
     }
     return rendered
 }
@@ -393,6 +445,10 @@ class FridaDeployer(private val appContext: Context) {
         const val TARGET_PID_WAIT_POLL_MS = 200L
         const val TARGET_PID_WAIT_TIMEOUT_MS = 5000L
         const val TARGET_PID_WAKE_RETRY_TIMEOUT_MS = 3000L
+        const val BACKGROUND_BYPASS_COPY_ENABLED = true
+        const val BACKGROUND_BYPASS_RENDER_ENABLED = true
+        const val BACKGROUND_FORCE_RENDER_LOOP = false
+        const val BACKGROUND_RECOVER_FRAME_COUNT = DEFAULT_BACKGROUND_RECOVER_FRAME_COUNT
 
         // 全局注入互斥，覆盖 UI/广播等多入口并发触发
         val injectOperationRunning = AtomicBoolean(false)
@@ -456,7 +512,16 @@ class FridaDeployer(private val appContext: Context) {
     ) = withContext(Dispatchers.IO) {
         outputFile.parentFile?.mkdirs()
         val template = appContext.assets.open(assetPath).bufferedReader(Charsets.UTF_8).use { it.readText() }
-        val rendered = renderHookScriptTemplate(template, targetFps)
+        val rendered = renderHookScriptTemplate(
+            template = template,
+            config = HookScriptRuntimeConfig(
+                targetFps = targetFps,
+                backgroundBypassCopy = BACKGROUND_BYPASS_COPY_ENABLED,
+                backgroundBypassRender = BACKGROUND_BYPASS_RENDER_ENABLED,
+                backgroundForceRenderLoop = BACKGROUND_FORCE_RENDER_LOOP,
+                recoverFrameCount = BACKGROUND_RECOVER_FRAME_COUNT
+            )
+        )
         outputFile.writeText(rendered, Charsets.UTF_8)
     }
 

@@ -1,0 +1,14 @@
+@startuml
+' UML-SYNC-META-BEGIN
+' module: overall
+' last_sync_utc: 2026-03-31T13:06:51Z
+' reason: changed
+' source: uml-sync
+' UML-SYNC-META-END
+hide empty description
+[*] --> SystemStart
+SystemStart --> Running : 系统启动
+Running --> Updating : 开发变更后同步
+Updating --> Running : UML 同步完成
+Running --> [*] : 系统停止
+@enduml

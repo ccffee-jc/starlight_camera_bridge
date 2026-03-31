@@ -244,20 +244,64 @@ class FridaDeployerPolicyTest {
     @Test
     fun renderHookScriptTemplate_shouldReplaceTargetFpsAndInterval() {
         val rendered = renderHookScriptTemplate(
-            "var targetFps = __TARGET_FPS__, minIntervalMs = __MIN_INTERVAL_MS__;",
-            12.5
+            """
+            var targetFps = __TARGET_FPS__, minIntervalMs = __MIN_INTERVAL_MS__;
+            var backgroundBypassCopy = __BACKGROUND_BYPASS_COPY__;
+            var backgroundBypassRender = __BACKGROUND_BYPASS_RENDER__;
+            var backgroundForceRenderLoop = __BACKGROUND_FORCE_RENDER_LOOP__;
+            var recoverFrameCount = __RECOVER_FRAME_COUNT__;
+            """.trimIndent(),
+            HookScriptRuntimeConfig(
+                targetFps = 12.5,
+                backgroundBypassCopy = true,
+                backgroundBypassRender = false,
+                backgroundForceRenderLoop = true,
+                recoverFrameCount = 5
+            )
         )
 
-        assertEquals("var targetFps = 12.5, minIntervalMs = 80;", rendered)
+        assertEquals(
+            """
+            var targetFps = 12.5, minIntervalMs = 80;
+            var backgroundBypassCopy = true;
+            var backgroundBypassRender = false;
+            var backgroundForceRenderLoop = true;
+            var recoverFrameCount = 5;
+            """.trimIndent(),
+            rendered
+        )
     }
 
     @Test
     fun renderHookScriptTemplate_shouldFailWhenPlaceholderMissing() {
         try {
-            renderHookScriptTemplate("var targetFps = __TARGET_FPS__;", 10.0)
+            renderHookScriptTemplate(
+                "var targetFps = __TARGET_FPS__;",
+                HookScriptRuntimeConfig(targetFps = 10.0)
+            )
             fail("expected placeholder validation failure")
         } catch (expected: IllegalArgumentException) {
             assertTrue(expected.message?.contains("__MIN_INTERVAL_MS__") == true)
         }
+    }
+
+    @Test
+    fun renderHookScriptTemplate_shouldClampRecoverFrameCountToZero() {
+        val rendered = renderHookScriptTemplate(
+            """
+            __TARGET_FPS__
+            __MIN_INTERVAL_MS__
+            __BACKGROUND_BYPASS_COPY__
+            __BACKGROUND_BYPASS_RENDER__
+            __BACKGROUND_FORCE_RENDER_LOOP__
+            __RECOVER_FRAME_COUNT__
+            """.trimIndent(),
+            HookScriptRuntimeConfig(
+                targetFps = 10.0,
+                recoverFrameCount = -3
+            )
+        )
+
+        assertTrue(rendered.endsWith("0"))
     }
 }
