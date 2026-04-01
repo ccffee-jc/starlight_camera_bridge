@@ -422,8 +422,47 @@ function getPlane(imgPtr, i) {
 
 var _origOnImageAvailable = null;
 var _origRenderWindow = null;
+var _origEglSwapBuffers = null;
 var _backgroundOnImageBypassInstalled = false;
 var _backgroundRenderBypassInstalled = false;
+var _backgroundEglSwapBypassInstalled = false;
+var _backgroundLibtestSwapBypassUnsupported = false;
+
+var GLMOD_EGL_SWAP_PLT_OFFSET = 0x56e0;
+
+function findModuleExportAddress(module, exportName) {
+    if (!module) return null;
+    try {
+        var exports = module.enumerateExports();
+        for (var i = 0; i < exports.length; i++) {
+            if (exports[i].name === exportName) return exports[i].address;
+        }
+    } catch (e) {}
+    return null;
+}
+
+function findModuleImport(module, importName) {
+    if (!module) return null;
+    try {
+        var imports = module.enumerateImports();
+        for (var i = 0; i < imports.length; i++) {
+            if (imports[i].name === importName) return imports[i];
+        }
+    } catch (e) {}
+    return null;
+}
+
+function resolveImportTargetAddress(imp) {
+    if (!imp) return null;
+    try {
+        if (imp.slot) {
+            var slotPtr = imp.slot.readPointer();
+            if (slotPtr && !slotPtr.isNull()) return slotPtr;
+        }
+    } catch (e) {}
+    if (imp.address) return imp.address;
+    return null;
+}
 
 function installBackgroundOnImageBypass() {
     if (_backgroundOnImageBypassInstalled || !BACKGROUND_BYPASS_COPY) return;
@@ -471,6 +510,50 @@ function installBackgroundOnImageBypass() {
 
 function installBackgroundRenderBypass() {
     if (_backgroundRenderBypassInstalled || !BACKGROUND_BYPASS_RENDER) return;
+    if (!glMod) glMod = findModule("libtest-opengl-swapinterval");
+    if (glMod && !_backgroundLibtestSwapBypassUnsupported) {
+        if (typeof Interceptor.replaceFast !== "function") {
+            log("[!] replaceFast unavailable, skip libtest eglSwap bypass");
+            return;
+        }
+        try {
+            var eglMod = findModule("libEGL");
+            var eglImport = findModuleImport(glMod, "eglSwapBuffers");
+            var glSwapBypassAddr = glMod.base.add(GLMOD_EGL_SWAP_PLT_OFFSET);
+            var glSwapOriginalAddr = eglMod
+                ? findModuleExportAddress(eglMod, "eglSwapBuffers")
+                : null;
+            if (!glSwapOriginalAddr) glSwapOriginalAddr = resolveImportTargetAddress(eglImport);
+            if (!glSwapOriginalAddr) throw new Error("unable to resolve eglSwapBuffers target");
+            if (glSwapBypassAddr.equals(glSwapOriginalAddr)) {
+                throw new Error("eglSwapBuffers thunk collapsed to real target");
+            }
+
+            var glSwapCallback = new NativeCallback(function(display, surface) {
+                if (hookDisabled || !isBackgroundBridgeMode()) {
+                    return _origEglSwapBuffers(display, surface);
+                }
+                backgroundRenderBypassCount++;
+                return 1;
+            }, "int", ["pointer", "pointer"]);
+            var glSwapOriginalPtr = null;
+            try {
+                glSwapOriginalPtr = Interceptor.replaceFast(glSwapBypassAddr, glSwapCallback);
+            } catch (fastError) {
+                Interceptor.replace(glSwapBypassAddr, glSwapCallback);
+                glSwapOriginalPtr = glSwapOriginalAddr;
+            }
+            _origEglSwapBuffers = new NativeFunction(glSwapOriginalPtr, "int", ["pointer", "pointer"]);
+            _backgroundRenderBypassInstalled = true;
+            _backgroundEglSwapBypassInstalled = true;
+            log("[✓] background libtest eglSwapBuffers bypass hooked thunk=" +
+                glSwapBypassAddr + " target=" + glSwapOriginalAddr);
+            return;
+        } catch (e) {
+            _backgroundLibtestSwapBypassUnsupported = true;
+            fileLog("[WARN] libtest eglSwap bypass unavailable: " + e.message);
+        }
+    }
     if (!avmFunctionMod) avmFunctionMod = findModule("libmtkavmfunction");
     if (!avmFunctionMod) return;
     if (typeof Interceptor.replaceFast !== "function") {
@@ -501,8 +584,42 @@ function installBackgroundRenderBypass() {
     }
 }
 
+function installBackgroundEglSwapBypass() {
+    if (_backgroundEglSwapBypassInstalled || !BACKGROUND_BYPASS_RENDER) return;
+    if (typeof Interceptor.replaceFast !== "function") {
+        log("[!] replaceFast unavailable, skip egl swap bypass");
+        return;
+    }
+    var eglSwapBuffersAddr = null;
+    try {
+        eglSwapBuffersAddr = Module.findExportByName("libEGL.so", "eglSwapBuffers");
+    } catch (e) {
+        eglSwapBuffersAddr = null;
+    }
+    if (!eglSwapBuffersAddr) return;
+    try {
+        var originalPtr = Interceptor.replaceFast(
+            eglSwapBuffersAddr,
+            new NativeCallback(function(display, surface) {
+                if (hookDisabled || !isBackgroundBridgeMode()) {
+                    return _origEglSwapBuffers(display, surface);
+                }
+                backgroundRenderBypassCount++;
+                return 1;
+            }, "int", ["pointer", "pointer"])
+        );
+        _origEglSwapBuffers = new NativeFunction(originalPtr, "int", ["pointer", "pointer"]);
+        _backgroundEglSwapBypassInstalled = true;
+        _backgroundRenderBypassInstalled = true;
+        log("[✓] background eglSwapBuffers bypass hooked");
+    } catch (e) {
+        safeHookError("install_background_egl_swap_bypass", e);
+    }
+}
+
 installBackgroundOnImageBypass();
 installBackgroundRenderBypass();
+installBackgroundEglSwapBypass();
 
 // 帧索引发送缓冲区（重用，预分配）
 var _idxBuf = Memory.alloc(1);
@@ -589,6 +706,7 @@ setInterval(function() {
 setInterval(function() {
     if (!_backgroundOnImageBypassInstalled) installBackgroundOnImageBypass();
     if (!_backgroundRenderBypassInstalled) installBackgroundRenderBypass();
+    if (!_backgroundEglSwapBypassInstalled) installBackgroundEglSwapBypass();
 }, 1000);
 
 setInterval(function() {
