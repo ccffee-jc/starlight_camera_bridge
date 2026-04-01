@@ -34,6 +34,43 @@ class FridaDeployerPolicyTest {
     }
 
     @Test
+    fun buildInjectedProcessCleanupOrder_killsTargetBeforeFridaProcesses() {
+        val order = buildInjectedProcessCleanupOrder("avm3d_service")
+
+        assertEquals(listOf("avm3d_service", "frida-inject", "frida-server"), order.map { it.processName })
+        assertEquals("目标进程 avm3d_service", order.first().displayName)
+    }
+
+    @Test
+    fun buildManagedInjectSessionCleanupOrder_keepsServerOutOfSessionRecovery() {
+        val order = buildManagedInjectSessionCleanupOrder("avm3d_service")
+
+        assertEquals(listOf("avm3d_service", "frida-inject"), order.map { it.processName })
+    }
+
+    @Test
+    fun shouldReuseBundledFridaBinary_requiresMatchingBundleVersion() {
+        assertTrue(
+            shouldReuseBundledFridaBinary(
+                remoteExists = true,
+                remoteBundleVersion = BUNDLED_FRIDA_BINARY_VERSION
+            )
+        )
+        assertFalse(
+            shouldReuseBundledFridaBinary(
+                remoteExists = true,
+                remoteBundleVersion = "17.4.0-android-arm64"
+            )
+        )
+        assertFalse(
+            shouldReuseBundledFridaBinary(
+                remoteExists = false,
+                remoteBundleVersion = BUNDLED_FRIDA_BINARY_VERSION
+            )
+        )
+    }
+
+    @Test
     fun decideInjectEntry_skipsReadySocketOnlyWhenNotStrict() {
         val decision = decideInjectEntry(
             strictRestart = false,
@@ -210,6 +247,73 @@ class FridaDeployerPolicyTest {
         assertTrue(result.positiveSignalDetected)
         assertFalse(result.fatalSignalDetected)
         assertTrue(result.canProceedToActivation)
+    }
+
+    @Test
+    fun parseManagedFridaLaunchObservation_parsesBackgroundMarkers() {
+        val observation = parseManagedFridaLaunchObservation(
+            """
+            __BG_PID__:12345
+            __BG_ALIVE__:1
+            """.trimIndent()
+        )
+
+        assertEquals("12345", observation.backgroundPid)
+        assertTrue(observation.processAlive)
+        assertFalse(observation.markerMissing)
+    }
+
+    @Test
+    fun extractLatestLogWindow_returnsContentAfterLastMarker() {
+        val marker = "==== frida-inject start ts=2 pid=200 mode=managed ===="
+        val window = extractLatestLogWindow(
+            logText = """
+                ==== frida-inject start ts=1 pid=100 mode=managed ====
+                old
+                $marker
+                new
+                lines
+            """.trimIndent(),
+            startMarker = marker
+        )
+
+        assertEquals("$marker\nnew\nlines", window)
+    }
+
+    @Test
+    fun collectProtectedProcessFridaResidues_parsesDistinctEntries() {
+        val residues = collectProtectedProcessFridaResidues(
+            """
+            zygote_secondary:21488:maps
+            zygote_secondary:21488:threads
+            zygote_secondary:21488:threads
+            system_server:16341:maps
+            """.trimIndent()
+        )
+
+        assertEquals(3, residues.size)
+        assertEquals("zygote_secondary", residues[0].processName)
+        assertEquals("21488", residues[0].pid)
+        assertEquals("maps", residues[0].evidence)
+        assertEquals("threads", residues[1].evidence)
+        assertEquals("system_server", residues[2].processName)
+    }
+
+    @Test
+    fun collectProtectedProcessFridaResidues_ignoresShellSyntaxNoise() {
+        val residues = collectProtectedProcessFridaResidues(
+            """
+            /system/bin/sh: syntax error: unexpected '('
+            system_server:16341:maps
+            zygote_secondary:syntax error:threads
+            random_process:123:maps
+            """.trimIndent()
+        )
+
+        assertEquals(1, residues.size)
+        assertEquals("system_server", residues[0].processName)
+        assertEquals("16341", residues[0].pid)
+        assertEquals("maps", residues[0].evidence)
     }
 
     @Test

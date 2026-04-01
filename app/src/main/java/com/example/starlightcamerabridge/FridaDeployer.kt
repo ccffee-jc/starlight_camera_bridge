@@ -26,6 +26,8 @@ import kotlin.math.ceil
  */
 internal const val DUPLICATE_INJECT_SKIP_WINDOW_MS = 60000L
 internal const val DEFAULT_BRIDGE_TARGET_FPS = 15.0
+internal const val BUNDLED_FRIDA_BINARY_VERSION =
+    "frida-server-17.6.2_frida-inject-17.4.0_android-arm64_disable-preload"
 private const val MIN_BRIDGE_TARGET_FPS = 5.0
 private const val MAX_BRIDGE_TARGET_FPS = 30.0
 private const val HOOK_SCRIPT_TARGET_FPS_PLACEHOLDER = "__TARGET_FPS__"
@@ -209,6 +211,40 @@ internal fun shouldRestartInnerAvmProcess(previousPid: String?, currentPid: Stri
     return previousPid == currentPid
 }
 
+internal data class CleanupTarget(
+    val processName: String,
+    val displayName: String
+)
+
+internal fun buildManagedInjectSessionCleanupOrder(targetProcess: String): List<CleanupTarget> {
+    return listOf(
+        CleanupTarget(
+            processName = targetProcess,
+            displayName = "目标进程 $targetProcess"
+        ),
+        CleanupTarget(
+            processName = "frida-inject",
+            displayName = "frida-inject"
+        )
+    )
+}
+
+internal fun buildInjectedProcessCleanupOrder(targetProcess: String): List<CleanupTarget> {
+    return buildManagedInjectSessionCleanupOrder(targetProcess) + CleanupTarget(
+        processName = "frida-server",
+        displayName = "frida-server"
+    )
+}
+
+internal fun shouldReuseBundledFridaBinary(
+    remoteExists: Boolean,
+    remoteBundleVersion: String?,
+    localBundleVersion: String = BUNDLED_FRIDA_BINARY_VERSION
+): Boolean {
+    if (!remoteExists) return false
+    return remoteBundleVersion?.trim() == localBundleVersion
+}
+
 internal data class ProcessKillObservation(
     val killExitCode: Int?,
     val pidAfterKill: String?,
@@ -251,6 +287,18 @@ internal data class FridaInjectAssessment(
     val positiveSignalDetected: Boolean,
     val fatalSignalDetected: Boolean,
     val canProceedToActivation: Boolean
+)
+
+internal data class ManagedFridaLaunchObservation(
+    val backgroundPid: String?,
+    val processAlive: Boolean,
+    val markerMissing: Boolean
+)
+
+internal data class ProtectedProcessFridaResidue(
+    val processName: String,
+    val pid: String,
+    val evidence: String
 )
 
 internal fun parseShellProbeResult(rawOutput: String, marker: String = "__HA_RC__:"): ShellProbeResult {
@@ -310,6 +358,57 @@ internal fun assessFridaInjectResult(
         fatalSignalDetected = fatalSignalDetected,
         canProceedToActivation = canProceedToActivation
     )
+}
+
+internal fun parseManagedFridaLaunchObservation(
+    rawOutput: String,
+    pidMarker: String = "__BG_PID__:",
+    aliveMarker: String = "__BG_ALIVE__:"
+): ManagedFridaLaunchObservation {
+    val lines = rawOutput.lineSequence().map { it.trim() }.toList()
+    val pidRaw = lines.firstOrNull { it.startsWith(pidMarker) }?.removePrefix(pidMarker)?.trim()
+    val aliveRaw = lines.firstOrNull { it.startsWith(aliveMarker) }?.removePrefix(aliveMarker)?.trim()
+    return ManagedFridaLaunchObservation(
+        backgroundPid = pidRaw?.takeIf { it.isNotEmpty() },
+        processAlive = aliveRaw == "1",
+        markerMissing = pidRaw == null || aliveRaw == null
+    )
+}
+
+internal fun extractLatestLogWindow(logText: String, startMarker: String): String {
+    val markerIndex = logText.lastIndexOf(startMarker)
+    if (markerIndex < 0) return logText.trim()
+    return logText.substring(markerIndex).trim()
+}
+
+internal fun collectProtectedProcessFridaResidues(rawOutput: String): List<ProtectedProcessFridaResidue> {
+    val protectedProcessNames = setOf(
+        "system_server",
+        "zygote",
+        "zygote64",
+        "zygote_secondary"
+    )
+    return rawOutput
+        .lineSequence()
+        .map { it.trim() }
+        .filter { it.isNotEmpty() }
+        .mapNotNull { line ->
+            val parts = line.split(':', limit = 3)
+            if (parts.size != 3) return@mapNotNull null
+            val processName = parts[0].trim()
+            val pid = parts[1].trim()
+            val evidence = parts[2].trim()
+            if (processName.isEmpty() || pid.isEmpty() || evidence.isEmpty()) return@mapNotNull null
+            if (processName !in protectedProcessNames) return@mapNotNull null
+            if (!pid.all { it.isDigit() }) return@mapNotNull null
+            ProtectedProcessFridaResidue(
+                processName = processName,
+                pid = pid,
+                evidence = evidence
+            )
+        }
+        .distinctBy { "${it.processName}:${it.pid}:${it.evidence}" }
+        .toList()
 }
 
 internal fun parsePidFromPsLine(psOutput: String, processName: String): String? {
@@ -401,6 +500,8 @@ class FridaDeployer(private val appContext: Context) {
         const val REMOTE_INJECTING_MARKER = "$REMOTE_TMP/starlight_bridge_injecting"
         /** 远端部署版本标记文件，内容为推送时的 APK versionCode */
         const val REMOTE_DEPLOY_VERSION = "$REMOTE_TMP/starlight_bridge_deploy.version"
+        /** 远端 Frida 二进制 bundle 标记，避免同版 APK 下资产升级被跳过 */
+        const val REMOTE_FRIDA_BUNDLE_VERSION = "$REMOTE_TMP/starlight_bridge_frida_bundle.version"
 
         // 目标进程
         const val TARGET_PROCESS = "avm3d_service"
@@ -445,10 +546,19 @@ class FridaDeployer(private val appContext: Context) {
         const val TARGET_PID_WAIT_POLL_MS = 200L
         const val TARGET_PID_WAIT_TIMEOUT_MS = 5000L
         const val TARGET_PID_WAKE_RETRY_TIMEOUT_MS = 3000L
+        const val FRIDA_MANAGED_INJECT_STARTUP_DELAY_MS = 1000L
+        const val FRIDA_MANAGED_INJECT_READY_TIMEOUT_MS = 5000L
+        const val FRIDA_MANAGED_INJECT_READY_POLL_MS = 250L
         const val BACKGROUND_BYPASS_COPY_ENABLED = true
         const val BACKGROUND_BYPASS_RENDER_ENABLED = true
         const val BACKGROUND_FORCE_RENDER_LOOP = false
         const val BACKGROUND_RECOVER_FRAME_COUNT = DEFAULT_BACKGROUND_RECOVER_FRAME_COUNT
+        val PROTECTED_PROCESS_NAMES = listOf(
+            "system_server",
+            "zygote",
+            "zygote64",
+            "zygote_secondary"
+        )
 
         // 全局注入互斥，覆盖 UI/广播等多入口并发触发
         val injectOperationRunning = AtomicBoolean(false)
@@ -654,6 +764,20 @@ class FridaDeployer(private val appContext: Context) {
         }
     }
 
+    private suspend fun waitForFridaServerStopped(
+        client: AdbClient,
+        timeoutMs: Long = 3_000L,
+        pollMs: Long = 200L
+    ): Boolean {
+        val startAt = System.currentTimeMillis()
+        while (true) {
+            if (!isFridaServerRunning(client)) return true
+            val elapsed = (System.currentTimeMillis() - startAt).coerceAtLeast(0)
+            if (elapsed >= timeoutMs) return false
+            delay(pollMs)
+        }
+    }
+
     private suspend fun readRemoteLogTail(
         client: AdbClient,
         path: String,
@@ -668,6 +792,108 @@ class FridaDeployer(private val appContext: Context) {
         if (builder.length > maxChars) {
             builder.delete(0, builder.length - maxChars)
         }
+    }
+
+    private suspend fun readInjectLogWindow(
+        client: AdbClient,
+        startMarker: String,
+        maxBytes: Int = 131072
+    ): String {
+        val fullLog = readRemoteLogTail(client, REMOTE_FRIDA_INJECT_LOG, maxBytes = maxBytes)
+        return extractLatestLogWindow(fullLog, startMarker)
+    }
+
+    private suspend fun detectProtectedProcessFridaResidues(client: AdbClient): List<ProtectedProcessFridaResidue> {
+        val processNames = PROTECTED_PROCESS_NAMES.joinToString(" ")
+        val output = client.executeShellCommand(
+            "for name in $processNames; do " +
+                "for pid in \$(pidof \$name 2>/dev/null); do " +
+                "if grep -aq frida-agent /proc/\$pid/maps 2>/dev/null; then echo \$name:\$pid:maps; fi; " +
+                "if cat /proc/\$pid/task/*/comm 2>/dev/null | grep -qx gum-js-loop; then echo \$name:\$pid:threads; " +
+                "elif cat /proc/\$pid/task/*/comm 2>/dev/null | grep -qx gmain; then echo \$name:\$pid:threads; " +
+                "elif cat /proc/\$pid/task/*/comm 2>/dev/null | grep -qx gdbus; then echo \$name:\$pid:threads; fi; " +
+                "done; " +
+                "done"
+        ).trim()
+        return collectProtectedProcessFridaResidues(output)
+    }
+
+    private suspend fun ensureNoProtectedProcessFridaResidues(
+        client: AdbClient,
+        log: LogCallback,
+        stageLabel: String
+    ): Boolean {
+        val residues = detectProtectedProcessFridaResidues(client)
+        if (residues.isEmpty()) return true
+        log.onLog("❌ $stageLabel：检测到受保护系统进程含有 Frida 残留，已中止注入以避免卡死/重启")
+        residues.forEach { residue ->
+            log.onLog(
+                "  • ${residue.processName} (PID=${residue.pid}) 命中 ${residue.evidence} 证据"
+            )
+        }
+        log.onLog("  ℹ️ 请先人工恢复到干净状态（建议重启设备）后再继续注入")
+        return false
+    }
+
+    private suspend fun startManagedFridaInjectSession(
+        client: AdbClient,
+        targetPid: String,
+        log: LogCallback
+    ): String? {
+        if (isFridaInjectRunning(client)) {
+            log.onLog("❌ 启动新会话前仍检测到 frida-inject 存活，拒绝直接覆盖旧会话")
+            return null
+        }
+
+        val startMarker = "==== frida-inject start ts=${System.currentTimeMillis()} pid=$targetPid mode=managed ===="
+        val launchOutput = client.executeShellCommand(
+            "echo $startMarker >> $REMOTE_FRIDA_INJECT_LOG; " +
+                "$REMOTE_FRIDA_INJECT -p $targetPid -s $REMOTE_HOOK_SCRIPT >> $REMOTE_FRIDA_INJECT_LOG 2>&1 & " +
+                "bg=\$!; echo __BG_PID__:\$bg; " +
+                "sleep 1; if kill -0 \$bg 2>/dev/null; then echo __BG_ALIVE__:1; else echo __BG_ALIVE__:0; fi"
+        )
+        delay(FRIDA_MANAGED_INJECT_STARTUP_DELAY_MS)
+
+        val launchObservation = parseManagedFridaLaunchObservation(launchOutput)
+        if (launchObservation.markerMissing) {
+            log.onLog("⚠️ frida-inject 后台启动标记缺失，将继续结合日志判定会话是否已建立")
+        } else if (!launchObservation.processAlive) {
+            log.onLog(
+                "⚠️ frida-inject 后台会话启动后未存活（PID=${launchObservation.backgroundPid ?: "unknown"}）"
+            )
+        } else {
+            log.onLog("✅ frida-inject 后台会话已启动 (PID=${launchObservation.backgroundPid})")
+        }
+        return startMarker
+    }
+
+    private suspend fun waitForManagedFridaInjectReady(
+        client: AdbClient,
+        log: LogCallback,
+        startMarker: String
+    ): Pair<Boolean, String> {
+        val deadlineAt = System.currentTimeMillis() + FRIDA_MANAGED_INJECT_READY_TIMEOUT_MS
+        var latestLogWindow: String
+        while (System.currentTimeMillis() < deadlineAt) {
+            latestLogWindow = readInjectLogWindow(client, startMarker)
+            val injectAssessment = assessFridaInjectResult(
+                rawOutput = "__RC:0",
+                injectLog = latestLogWindow
+            )
+            if (injectAssessment.fatalSignalDetected) {
+                return false to latestLogWindow
+            }
+            if (!ensureNoProtectedProcessFridaResidues(client, log, "注入后安全检查")) {
+                return false to latestLogWindow
+            }
+            val injectRunning = isFridaInjectRunning(client)
+            if (injectAssessment.positiveSignalDetected && injectRunning) {
+                return true to latestLogWindow
+            }
+            delay(FRIDA_MANAGED_INJECT_READY_POLL_MS)
+        }
+        latestLogWindow = readInjectLogWindow(client, startMarker)
+        return false to latestLogWindow
     }
 
     /**
@@ -908,14 +1134,40 @@ class FridaDeployer(private val appContext: Context) {
         log.onLog("  🧹 已清理 bridge socket 与注入标记（保留二进制/脚本/日志）")
     }
 
+    private suspend fun ensureNoActiveManagedInjectSession(
+        client: AdbClient,
+        currentPid: String,
+        log: LogCallback
+    ): String? {
+        if (!isFridaInjectRunning(client)) return currentPid
+        log.onLog("⚠️ 检测到旧 frida-inject 托管会话，先按安全顺序清理旧状态")
+        for (target in buildManagedInjectSessionCleanupOrder(TARGET_PROCESS)) {
+            killProcessByName(client, target.processName, target.displayName, log)
+        }
+        clearRuntimeStateWithoutRemovingFiles(client, log)
+        val restartedPid = restartTargetProcessForReinject(
+            client = client,
+            oldPid = currentPid,
+            log = log,
+            reasonLabel = "旧托管会话清理"
+        )
+        if (restartedPid.isNullOrBlank()) {
+            log.onLog("❌ 旧托管会话清理后未等到目标进程恢复")
+            return null
+        }
+        log.onLog("✅ 已清理旧托管会话，新目标 PID=$restartedPid")
+        return restartedPid
+    }
+
     private suspend fun prepareStrictReinject(
         client: AdbClient,
         currentPid: String,
         log: LogCallback
     ): String? {
         log.onLog("🔒 严格重启重注入：清理目标进程与 Frida 运行态，但保留部署文件")
-        killProcessByName(client, "frida-server", "frida-server", log)
-        killProcessByName(client, "frida-inject", "frida-inject", log)
+        for (target in buildInjectedProcessCleanupOrder(TARGET_PROCESS)) {
+            killProcessByName(client, target.processName, target.displayName, log)
+        }
         clearRuntimeStateWithoutRemovingFiles(client, log)
         val restartedPid = restartTargetProcessForReinject(
             client = client,
@@ -929,6 +1181,25 @@ class FridaDeployer(private val appContext: Context) {
         }
         log.onLog("✅ 严格重启后目标进程已重新拉起，新 PID=$restartedPid")
         return restartedPid
+    }
+
+    private suspend fun cleanupAfterManagedInjectFailure(
+        client: AdbClient,
+        log: LogCallback,
+        reasonLabel: String
+    ) {
+        log.onLog("🧹 $reasonLabel：按安全顺序回收未完成的托管注入会话")
+        for (target in buildManagedInjectSessionCleanupOrder(TARGET_PROCESS)) {
+            killProcessByName(client, target.processName, target.displayName, log)
+        }
+        clearRuntimeStateWithoutRemovingFiles(client, log)
+        val residues = detectProtectedProcessFridaResidues(client)
+        if (residues.isNotEmpty()) {
+            log.onLog("⚠️ 回收后仍检测到系统进程存在 Frida 残留，建议重启设备后再继续联调")
+            residues.forEach { residue ->
+                log.onLog("  • ${residue.processName} (PID=${residue.pid}) 命中 ${residue.evidence} 证据")
+            }
+        }
     }
 
     /**
@@ -1176,6 +1447,13 @@ class FridaDeployer(private val appContext: Context) {
         client.executeShellCommand("rm -f $REMOTE_INJECTING_MARKER 2>/dev/null || true")
     }
 
+    private suspend fun syncFridaBundleVersionMarker(client: AdbClient) {
+        client.executeShellCommand(
+            "printf '%s' '$BUNDLED_FRIDA_BINARY_VERSION' > $REMOTE_FRIDA_BUNDLE_VERSION 2>/dev/null; " +
+                "chmod 644 $REMOTE_FRIDA_BUNDLE_VERSION 2>/dev/null || true"
+        )
+    }
+
     // ========== 核心操作 ==========
 
     /**
@@ -1211,6 +1489,7 @@ class FridaDeployer(private val appContext: Context) {
             client.connect(host, port)
             log.onLog("✅ ADB 已连接")
             log.onLog("🎯 本次 bridge 采集节流 targetFps=$formattedTargetFps minIntervalMs=$minIntervalMs")
+            log.onLog("🧩 内置 Frida 二进制版本=$BUNDLED_FRIDA_BINARY_VERSION")
             markInjectingInProgress(client)
             log.onLog("ℹ️ 已写入注入中标记")
 
@@ -1314,37 +1593,59 @@ class FridaDeployer(private val appContext: Context) {
                 "cat $REMOTE_DEPLOY_VERSION 2>/dev/null"
             ).trim()
             val versionMatch = remoteVersionCode == currentVersionCode
+            val remoteFridaBundleVersion = client.executeShellCommand(
+                "cat $REMOTE_FRIDA_BUNDLE_VERSION 2>/dev/null"
+            ).trim().ifEmpty { null }
+            val fridaBundleMatch = remoteFridaBundleVersion == BUNDLED_FRIDA_BINARY_VERSION
             if (versionMatch) {
                 log.onLog("  ℹ️ 远端版本与当前 APK 一致（versionCode=$currentVersionCode），按需跳过")
             } else {
                 val reason = if (remoteVersionCode.isEmpty()) "版本标记缺失" else "远端=$remoteVersionCode，当前=$currentVersionCode"
                 log.onLog("  ⚠️ 版本不一致（$reason），将重新推送所有文件")
             }
+            if (fridaBundleMatch) {
+                log.onLog("  ℹ️ 远端 Frida 二进制 bundle 已匹配（$BUNDLED_FRIDA_BINARY_VERSION）")
+            } else {
+                val reason = if (remoteFridaBundleVersion.isNullOrBlank()) {
+                    "bundle 标记缺失"
+                } else {
+                    "远端=$remoteFridaBundleVersion，当前=$BUNDLED_FRIDA_BINARY_VERSION"
+                }
+                log.onLog("  ⚠️ Frida 二进制 bundle 不一致（$reason），将重推 server/inject")
+            }
             val localStageDir = ensureLocalStageDir()
 
             // frida-server
             val serverExists = remoteFileExists(client, REMOTE_FRIDA_SERVER)
-            if (serverExists && versionMatch) {
-                log.onLog("  ✅ frida-server 已就绪（版本一致）")
+            val reuseServerBinary = shouldReuseBundledFridaBinary(
+                remoteExists = serverExists,
+                remoteBundleVersion = remoteFridaBundleVersion
+            )
+            if (reuseServerBinary) {
+                log.onLog("  ✅ frida-server 已就绪（bundle 一致）")
             } else {
                 val localServerFile = File(localStageDir, LOCAL_STAGE_FRIDA_SERVER)
                 decompressXzAssetToFile(ASSET_FRIDA_SERVER_XZ, localServerFile)
                 val localServerMd5 = computeFileMd5(localServerFile)
                 if (!serverExists) log.onLog("  📤 复制 frida-server（文件缺失，${localServerFile.length() / 1024 / 1024}MB）...")
-                else log.onLog("  📤 重新复制 frida-server（版本变更，${localServerFile.length() / 1024 / 1024}MB）...")
+                else log.onLog("  📤 重新复制 frida-server（bundle 变化，${localServerFile.length() / 1024 / 1024}MB）...")
                 copyLocalAndVerify(client, localServerFile, REMOTE_FRIDA_SERVER, 493, localServerMd5, "frida-server", log)
             }
 
             // frida-inject
             val injectExists = remoteFileExists(client, REMOTE_FRIDA_INJECT)
-            if (injectExists && versionMatch) {
-                log.onLog("  ✅ frida-inject 已就绪（版本一致）")
+            val reuseInjectBinary = shouldReuseBundledFridaBinary(
+                remoteExists = injectExists,
+                remoteBundleVersion = remoteFridaBundleVersion
+            )
+            if (reuseInjectBinary) {
+                log.onLog("  ✅ frida-inject 已就绪（bundle 一致）")
             } else {
                 val localInjectFile = File(localStageDir, LOCAL_STAGE_FRIDA_INJECT)
                 decompressXzAssetToFile(ASSET_FRIDA_INJECT_XZ, localInjectFile)
                 val localInjectMd5 = computeFileMd5(localInjectFile)
                 if (!injectExists) log.onLog("  📤 复制 frida-inject（文件缺失）...")
-                else log.onLog("  📤 重新复制 frida-inject（版本变更）...")
+                else log.onLog("  📤 重新复制 frida-inject（bundle 变化）...")
                 copyLocalAndVerify(client, localInjectFile, REMOTE_FRIDA_INJECT, 493, localInjectMd5, "frida-inject", log)
             }
 
@@ -1371,6 +1672,10 @@ class FridaDeployer(private val appContext: Context) {
                 client.executeShellCommand("printf '%s' '$currentVersionCode' > $REMOTE_DEPLOY_VERSION")
                 log.onLog("  📝 已更新远端版本标记（versionCode=$currentVersionCode）")
             }
+            if (!fridaBundleMatch || !reuseServerBinary || !reuseInjectBinary) {
+                syncFridaBundleVersionMarker(client)
+                log.onLog("  📝 已更新远端 Frida bundle 标记（$BUNDLED_FRIDA_BINARY_VERSION）")
+            }
 
             // 确保权限正确
             client.executeShellCommand("chmod 755 $REMOTE_FRIDA_SERVER $REMOTE_FRIDA_INJECT")
@@ -1395,13 +1700,24 @@ class FridaDeployer(private val appContext: Context) {
             log.onLog("✅ 文件部署完成")
 
             // 6. 启动 frida-server（如果未运行）
-            if (!isFridaServerRunning(client)) {
-                log.onLog("🚀 启动 frida-server（托管模式）...")
+            val serverRunningBeforeLaunch = isFridaServerRunning(client)
+            val shouldRestartRunningServer = serverRunningBeforeLaunch && !fridaBundleMatch
+            if (shouldRestartRunningServer) {
+                log.onLog("🔄 检测到旧版 frida-server 正在运行，先回收后再加载 bundle=$BUNDLED_FRIDA_BINARY_VERSION")
+                killProcessByName(client, "frida-server", "frida-server", log)
+                if (waitForFridaServerStopped(client)) {
+                    log.onLog("✅ 旧 frida-server 已退出")
+                } else {
+                    log.onLog("⚠️ 等待旧 frida-server 退出超时，继续尝试拉起新版本")
+                }
+            }
+            if (!serverRunningBeforeLaunch || shouldRestartRunningServer) {
+                log.onLog("🚀 启动 frida-server（托管模式，disable-preload）...")
                 fridaServerClient = AdbClient(appContext).also { managedClient ->
                     managedClient.connect(host, port)
                     fridaServerStream = managedClient.openShellStream(
                         "echo ==== frida-server start ts=\$(date +%s%3N) ==== >> $REMOTE_FRIDA_SERVER_LOG; " +
-                            "exec $REMOTE_FRIDA_SERVER -l 0.0.0.0 >> $REMOTE_FRIDA_SERVER_LOG 2>&1"
+                            "exec $REMOTE_FRIDA_SERVER --disable-preload -l 0.0.0.0 >> $REMOTE_FRIDA_SERVER_LOG 2>&1"
                     )
                     val stream = checkNotNull(fridaServerStream)
                     fridaServerStreamJob = CoroutineScope(Dispatchers.IO).launch {
@@ -1436,6 +1752,15 @@ class FridaDeployer(private val appContext: Context) {
                 log.onLog("✅ frida-server 已在运行")
             }
 
+            if (!ensureNoProtectedProcessFridaResidues(client, log, "注入前安全检查")) {
+                return
+            }
+
+            ensureNoActiveManagedInjectSession(client, currentPid, log) ?: run {
+                explainMissingTargetProcess(client, log)
+                return
+            }
+
             // 7. 注入前重启 inneravmservice，避免旧实例导致首帧迟迟不触发
             restartInnerAvmBeforeInject(client, log)
 
@@ -1455,33 +1780,26 @@ class FridaDeployer(private val appContext: Context) {
                 log.onLog("ℹ️ 注入前目标 PID 由 ps 回退识别（pidof 未命中）")
             }
             log.onLog("💉 使用 frida-inject 注入到 PID=$freshPid...")
-            val injectOutput = client.executeShellCommand(
-                "echo ==== frida-inject start ts=\$(date +%s%3N) pid=$freshPid ==== >> $REMOTE_FRIDA_INJECT_LOG; " +
-                    "$REMOTE_FRIDA_INJECT -p $freshPid -s $REMOTE_HOOK_SCRIPT -e " +
-                    ">> $REMOTE_FRIDA_INJECT_LOG 2>&1; echo __RC:\$?"
+            log.onLog("ℹ️ 使用后台持有会话模式，禁用 eternalize 以避免污染 zygote/system_server")
+            val injectStartMarker = startManagedFridaInjectSession(
+                client = client,
+                targetPid = freshPid,
+                log = log
+            ) ?: run {
+                log.onLog("❌ 无法启动 frida-inject 后台会话")
+                return
+            }
+            val (injectReady, injectLogWindow) = waitForManagedFridaInjectReady(
+                client = client,
+                log = log,
+                startMarker = injectStartMarker
             )
-            delay(1000)
-
-            // 9. 验证注入结果
-            val injectLog = client.executeShellCommand("tail -c 131072 $REMOTE_FRIDA_INJECT_LOG 2>/dev/null").trim()
-            if (injectLog.isNotEmpty()) {
-                log.onLog("📋 frida-inject 输出:\n$injectLog")
+            if (injectLogWindow.isNotEmpty()) {
+                log.onLog("📋 frida-inject 输出:\n$injectLogWindow")
             }
 
-            val injectAssessment = assessFridaInjectResult(injectOutput, injectLog, marker = "__RC:")
-            if (injectAssessment.markerMissing) {
-                log.onLog("⚠️ frida-inject 退出码标记缺失，将结合脚本加载信号与 bridge 就绪情况继续判定")
-            }
-            if (injectAssessment.positiveSignalDetected) {
-                log.onLog("ℹ️ 已检测到脚本加载正向信号，继续触发 AVM 激活并等待 bridge socket")
-            }
-
-            if (injectAssessment.canProceedToActivation) {
-                if (injectAssessment.exitCode == 0) {
-                    log.onLog("✅ 注入完成（eternalize 模式，脚本已常驻目标进程）")
-                } else {
-                    log.onLog("✅ 注入命令未返回可靠退出码，但日志显示脚本已驻留，继续验证 bridge 就绪")
-                }
+            if (injectReady) {
+                log.onLog("✅ 注入完成（后台会话持有中，脚本随 frida-inject 生命周期驻留）")
 
                 // 10. 优先激活一次 360，再等待 bridge 就绪
                 activateAvmViaActivity(client, log)
@@ -1501,11 +1819,12 @@ class FridaDeployer(private val appContext: Context) {
                     log.onLog("⚠️ bridge socket 仍未就绪，跳过收口并暂不写入注入时间标记，允许哨兵快速重试")
                 }
             } else {
-                val displayExit = injectAssessment.exitCode?.toString() ?: "unknown"
-                log.onLog("❌ 注入失败（exit=$displayExit）")
-                if (injectAssessment.markerMissing) {
-                    log.onLog("⚠️ 注入失败时未解析到退出码标记")
-                }
+                cleanupAfterManagedInjectFailure(
+                    client = client,
+                    log = log,
+                    reasonLabel = "注入失败收尾"
+                )
+                log.onLog("❌ 注入失败：后台会话未就绪或触发了系统进程污染守卫")
                 return
             }
 
@@ -1566,9 +1885,9 @@ class FridaDeployer(private val appContext: Context) {
     private suspend fun restoreInjectedState(client: AdbClient, log: LogCallback) {
         log.onLog("🔄 正在还原：杀死所有相关进程并清理所有远端文件...")
 
-        killProcessByName(client, TARGET_PROCESS, "目标进程 $TARGET_PROCESS", log)
-        killProcessByName(client, "frida-server", "frida-server", log)
-        killProcessByName(client, "frida-inject", "frida-inject", log)
+        for (target in buildInjectedProcessCleanupOrder(TARGET_PROCESS)) {
+            killProcessByName(client, target.processName, target.displayName, log)
+        }
 
         // 删除所有远端文件（包括二进制及部署版本标记）
         client.executeShellCommand(
@@ -1589,6 +1908,14 @@ class FridaDeployer(private val appContext: Context) {
             log.onLog("✅ 目标进程已恢复运行 (PID=$restartedPid)")
         } else {
             log.onLog("⚠️ 目标进程尚未恢复，等待系统拉起")
+        }
+
+        val residues = detectProtectedProcessFridaResidues(client)
+        if (residues.isNotEmpty()) {
+            log.onLog("⚠️ 恢复后仍检测到系统进程存在 Frida 残留，建议重启设备后再继续联调")
+            residues.forEach { residue ->
+                log.onLog("  • ${residue.processName} (PID=${residue.pid}) 命中 ${residue.evidence} 证据")
+            }
         }
     }
 }
