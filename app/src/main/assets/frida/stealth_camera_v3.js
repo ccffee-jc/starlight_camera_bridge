@@ -22,6 +22,7 @@ var _open = new NativeFunction(_libc.getExportByName("open"), "int", ["pointer",
 var _write_raw = new NativeFunction(_libc.getExportByName("write"), "int", ["int", "pointer", "int"]);
 var _close = new NativeFunction(_libc.getExportByName("close"), "int", ["int"]);
 var _strlen = new NativeFunction(_libc.getExportByName("strlen"), "int", ["pointer"]);
+var _unlink_raw = new NativeFunction(_libc.getExportByName("unlink"), "int", ["pointer"]);
 var _logFd = _open(Memory.allocUtf8String(LOG_FILE), 0x441, 0x1b6);
 
 function fileLog(msg) {
@@ -212,12 +213,16 @@ function ensureSocketNF() {
 
 // ==================== STATE ====================
 var SOCK_PATH = "/data/local/tmp/starlight_bridge.sock";
+var STREAM_READY_MARKER_PATH = "/data/local/tmp/starlight_bridge_stream_ready";
+var STREAM_READY_MIN_SENT_FRAMES = 3;
 var maxFrames = 4;
 var planeLenY = 0, planeLenU = 0, planeLenV = 0, frameSlotSize = 0;
 var ringReady = false;
 var _memfd_fds = [], _memfd_addrs = [];
 var _serverFd = -1, _clientFd = -1;
 var clientReady = false; // handshake 完成
+var clientSentSinceHandshake = 0;
+var streamReadyMarked = false;
 var frameWidth = 0, frameHeight = 0, frameFmt = 0;
 var wireWidth = 0, wireHeight = 0;
 var frameCount = 0, skippedCount = 0, sentCount = 0;
@@ -226,6 +231,33 @@ var targetFps = __TARGET_FPS__, minIntervalMs = __MIN_INTERVAL_MS__;
 var FORCE_OUTPUT_RES = false;
 var OUTPUT_WIDTH = 2560;
 var OUTPUT_HEIGHT = 1920;
+
+function clearStreamReadyMarker(reason) {
+    _unlink_raw(Memory.allocUtf8String(STREAM_READY_MARKER_PATH));
+    if (streamReadyMarked) {
+        log("[*] stream_ready marker cleared" + (reason ? " reason=" + reason : ""));
+    }
+    streamReadyMarked = false;
+    clientSentSinceHandshake = 0;
+}
+
+function writeStreamReadyMarker() {
+    if (streamReadyMarked) return;
+    var fd = _open(Memory.allocUtf8String(STREAM_READY_MARKER_PATH), 0x241, 0x1b6);
+    if (fd < 0) {
+        log("[!] stream_ready marker open fail");
+        return;
+    }
+    var payload = Memory.allocUtf8String(String(Date.now()));
+    _write_raw(fd, payload, _strlen(payload));
+    _close(fd);
+    streamReadyMarked = true;
+    log("[✓] stream_ready marker: " + STREAM_READY_MARKER_PATH +
+        " sent_since_handshake=" + clientSentSinceHandshake +
+        " total_sent=" + sentCount);
+}
+
+clearStreamReadyMarker("script_init");
 
 function resolveWireDimensions(srcW, srcH) {
     if (!FORCE_OUTPUT_RES) return [srcW, srcH];
@@ -322,6 +354,7 @@ function doHandshake() {
     if (flags2 >= 0) _nfFcntl(_clientFd, 4, flags2 | 0x800);
 
     clientReady = true;
+    clientSentSinceHandshake = 0;
     log("[✓] handshake complete! client ready for frames");
 }
 
@@ -666,11 +699,16 @@ Interceptor.attach(ex["AImageReader_acquireLatestImage"], {
                 var sn = _nfSend(_clientFd, _idxBuf, 1, MSG_DONTWAIT | MSG_NOSIGNAL);
                 if (sn === 1) {
                     sentCount++;
+                    clientSentSinceHandshake++;
+                    if (!streamReadyMarked && clientSentSinceHandshake >= STREAM_READY_MIN_SENT_FRAMES) {
+                        writeStreamReadyMarker();
+                    }
                 } else {
                     // 客户端可能断开
                     clientReady = false;
                     _close(_clientFd);
                     _clientFd = -1;
+                    clearStreamReadyMarker("client_disconnect");
                     log("[!] client disconnected (send fail)");
                 }
             }

@@ -145,6 +145,14 @@ internal data class DuplicateInjectDecision(
     val reason: String
 )
 
+internal data class BridgeReadinessState(
+    val socketReady: Boolean,
+    val streamReady: Boolean
+) {
+    val ready: Boolean
+        get() = socketReady && streamReady
+}
+
 internal data class InjectEntryDecision(
     val shouldSkipBecauseSocketReady: Boolean,
     val shouldBypassDuplicateWindow: Boolean
@@ -152,9 +160,9 @@ internal data class InjectEntryDecision(
 
 internal fun decideInjectEntry(
     strictRestart: Boolean,
-    bridgeSocketReady: Boolean
+    bridgeReady: Boolean
 ): InjectEntryDecision {
-    if (bridgeSocketReady && !strictRestart) {
+    if (bridgeReady && !strictRestart) {
         return InjectEntryDecision(
             shouldSkipBecauseSocketReady = true,
             shouldBypassDuplicateWindow = false
@@ -170,6 +178,7 @@ internal fun decideDuplicateInjection(
     lastInjectAtMs: Long,
     nowMs: Long,
     bridgeSocketReady: Boolean,
+    bridgeStreamReady: Boolean,
     lastInjectPid: String?,
     currentPid: String
 ): DuplicateInjectDecision {
@@ -179,10 +188,16 @@ internal fun decideDuplicateInjection(
             reason = "outside_window"
         )
     }
-    if (bridgeSocketReady) {
+    if (bridgeSocketReady && bridgeStreamReady) {
         return DuplicateInjectDecision(
             shouldSkip = true,
-            reason = "socket_ready"
+            reason = "bridge_ready"
+        )
+    }
+    if (bridgeSocketReady) {
+        return DuplicateInjectDecision(
+            shouldSkip = false,
+            reason = "stream_not_ready"
         )
     }
     val lastPid = lastInjectPid?.trim().orEmpty()
@@ -195,6 +210,24 @@ internal fun decideDuplicateInjection(
     return DuplicateInjectDecision(
         shouldSkip = false,
         reason = "socket_missing"
+    )
+}
+
+internal fun parseBridgeReadinessState(rawOutput: String): BridgeReadinessState {
+    var socketReady = false
+    var streamReady = false
+    rawOutput.lineSequence().forEach { rawLine ->
+        val line = rawLine.trim()
+        when {
+            line.startsWith("__BRIDGE_SOCKET__:") ->
+                socketReady = line.removePrefix("__BRIDGE_SOCKET__:").trim() == "1"
+            line.startsWith("__BRIDGE_STREAM__:") ->
+                streamReady = line.removePrefix("__BRIDGE_STREAM__:").trim() == "1"
+        }
+    }
+    return BridgeReadinessState(
+        socketReady = socketReady,
+        streamReady = streamReady
     )
 }
 
@@ -496,6 +529,7 @@ class FridaDeployer(private val appContext: Context) {
         const val REMOTE_FRIDA_SERVER_LOG = "$REMOTE_TMP/frida_server.log"
         const val REMOTE_FRIDA_INJECT_LOG = "$REMOTE_TMP/frida_inject.log"
         const val REMOTE_BRIDGE_SOCKET = "$REMOTE_TMP/starlight_bridge.sock"
+        const val REMOTE_STREAM_READY_MARKER = "$REMOTE_TMP/starlight_bridge_stream_ready"
         const val REMOTE_LAST_INJECT_MARKER = "$REMOTE_TMP/starlight_bridge_last_inject_ms"
         const val REMOTE_INJECTING_MARKER = "$REMOTE_TMP/starlight_bridge_injecting"
         /** 远端部署版本标记文件，内容为推送时的 APK versionCode */
@@ -1066,14 +1100,17 @@ class FridaDeployer(private val appContext: Context) {
     }
 
     /**
-     * 检测 bridge socket 是否已就绪。
-     * 同时检查文件存在性和 /proc/net/unix 中的实际监听状态。
+     * 读取 bridge 当前就绪状态。
+     * 同时检查公共 socket 是否存在且可监听，以及脚本侧 stream_ready marker 是否已写入。
      */
-    private suspend fun isBridgeSocketReady(client: AdbClient): Boolean {
-        val out = client.executeShellCommand(
-            "if [ -S $REMOTE_BRIDGE_SOCKET ] && grep -F \" $REMOTE_BRIDGE_SOCKET\" /proc/net/unix >/dev/null 2>&1; then echo YES; else echo NO; fi"
+    private suspend fun readBridgeReadinessState(client: AdbClient): BridgeReadinessState {
+        val raw = client.executeShellCommand(
+            "if [ -S $REMOTE_BRIDGE_SOCKET ] && grep -F \" $REMOTE_BRIDGE_SOCKET\" /proc/net/unix >/dev/null 2>&1; " +
+                "then echo __BRIDGE_SOCKET__:1; else echo __BRIDGE_SOCKET__:0; fi; " +
+                "if [ -f $REMOTE_STREAM_READY_MARKER ]; then echo __BRIDGE_STREAM__:1; " +
+                "else echo __BRIDGE_STREAM__:0; fi"
         ).trim()
-        return out.contains("YES")
+        return parseBridgeReadinessState(raw)
     }
 
     // ========== 进程管理 ==========
@@ -1128,7 +1165,8 @@ class FridaDeployer(private val appContext: Context) {
         log: LogCallback
     ) {
         client.executeShellCommand(
-            "rm -f $REMOTE_BRIDGE_SOCKET $REMOTE_LAST_INJECT_MARKER $REMOTE_INJECTING_MARKER 2>/dev/null || true"
+            "rm -f $REMOTE_BRIDGE_SOCKET $REMOTE_STREAM_READY_MARKER " +
+                "$REMOTE_LAST_INJECT_MARKER $REMOTE_INJECTING_MARKER 2>/dev/null || true"
         )
         FridaInjectTimestampPreferences.clear(appContext)
         log.onLog("  🧹 已清理 bridge socket 与注入标记（保留二进制/脚本/日志）")
@@ -1384,10 +1422,10 @@ class FridaDeployer(private val appContext: Context) {
      * @param timeoutMs 超时时间（毫秒）
      * @return true = 在超时前已就绪
      */
-    private suspend fun waitBridgeSocketReady(client: AdbClient, timeoutMs: Long): Boolean {
+    private suspend fun waitBridgeReady(client: AdbClient, timeoutMs: Long): Boolean {
         val deadline = System.currentTimeMillis() + timeoutMs
         while (System.currentTimeMillis() < deadline) {
-            if (isBridgeSocketReady(client)) return true
+            if (readBridgeReadinessState(client).ready) return true
             delay(BRIDGE_READY_WAIT_POLL_MS)
         }
         return false
@@ -1398,25 +1436,25 @@ class FridaDeployer(private val appContext: Context) {
      *
      * 先等待一轮，若未就绪则通过补偿激活 Activity 重试。
      *
-     * @return true = bridge socket 已就绪
+     * @return true = bridge 已就绪（socket + stream_ready）
      */
     private suspend fun ensureBridgeSocketReadyAfterInject(
         client: AdbClient,
         log: LogCallback
     ): Boolean {
         // 第一轮：等待 BRIDGE_READY_WAIT_TIMEOUT_MS
-        if (waitBridgeSocketReady(client, BRIDGE_READY_WAIT_TIMEOUT_MS)) {
-            log.onLog("✅ bridge socket 已就绪")
+        if (waitBridgeReady(client, BRIDGE_READY_WAIT_TIMEOUT_MS)) {
+            log.onLog("✅ bridge 已就绪（socket + stream_ready）")
             return true
         }
 
         // 补偿重试
         for (i in 0 until BRIDGE_READY_WAKE_RETRY_COUNT) {
             val attempt = i + 1
-            log.onLog("⚠️ bridge socket 未就绪，尝试补偿激活 360（$attempt/$BRIDGE_READY_WAKE_RETRY_COUNT）")
+            log.onLog("⚠️ bridge 未就绪（等待 stream_ready），尝试补偿激活 360（$attempt/$BRIDGE_READY_WAKE_RETRY_COUNT）")
             activateAvmViaActivity(client, log)
-            if (waitBridgeSocketReady(client, BRIDGE_READY_WAIT_RETRY_TIMEOUT_MS)) {
-                log.onLog("✅ bridge socket 已就绪（补偿激活后）")
+            if (waitBridgeReady(client, BRIDGE_READY_WAIT_RETRY_TIMEOUT_MS)) {
+                log.onLog("✅ bridge 已就绪（补偿激活后，socket + stream_ready）")
                 return true
             }
         }
@@ -1514,13 +1552,13 @@ class FridaDeployer(private val appContext: Context) {
                 log.onLog("✅ 找到目标进程 PID=$currentPid")
             }
 
-            val bridgeSocketReady = isBridgeSocketReady(client)
+            val bridgeReadiness = readBridgeReadinessState(client)
             val entryDecision = decideInjectEntry(
                 strictRestart = strictRestart,
-                bridgeSocketReady = bridgeSocketReady
+                bridgeReady = bridgeReadiness.ready
             )
             if (entryDecision.shouldSkipBecauseSocketReady) {
-                log.onLog("✅ bridge socket 已就绪，跳过重复注入")
+                log.onLog("✅ bridge 已就绪（socket + stream_ready），跳过重复注入")
                 val injectAtMs = System.currentTimeMillis()
                 FridaInjectTimestampPreferences.setLastInjectAtMs(appContext, injectAtMs)
                 FridaInjectTimestampPreferences.setLastInjectPid(appContext, currentPid)
@@ -1551,7 +1589,8 @@ class FridaDeployer(private val appContext: Context) {
                 val duplicateDecision = decideDuplicateInjection(
                     lastInjectAtMs = lastInjectAtMs,
                     nowMs = nowMs,
-                    bridgeSocketReady = bridgeSocketReady,
+                    bridgeSocketReady = bridgeReadiness.socketReady,
+                    bridgeStreamReady = bridgeReadiness.streamReady,
                     lastInjectPid = lastInjectPid,
                     currentPid = currentPid
                 )
@@ -1565,6 +1604,12 @@ class FridaDeployer(private val appContext: Context) {
                         log.onLog(
                             "ℹ️ 距离上次注入 ${elapsed / 1000}s，但目标 PID 已变化 " +
                                 "($lastInjectPid -> $currentPid)，忽略 60 秒窗口强制重注入"
+                        )
+                    }
+                    "stream_not_ready" -> {
+                        log.onLog(
+                            "ℹ️ 距离上次注入 ${elapsed / 1000}s，bridge socket 已存在但 stream_ready 未达成，" +
+                                "忽略 60 秒窗口强制重注入"
                         )
                     }
                     "socket_missing" -> {
@@ -1816,7 +1861,7 @@ class FridaDeployer(private val appContext: Context) {
                     log.onLog("🕒 已写入本次注入时间标记")
                 } else {
                     retainInjectingMarker = true
-                    log.onLog("⚠️ bridge socket 仍未就绪，跳过收口并暂不写入注入时间标记，允许哨兵快速重试")
+                    log.onLog("⚠️ bridge 仍未就绪（socket + stream_ready 未同时满足），跳过收口并暂不写入注入时间标记，允许哨兵快速重试")
                 }
             } else {
                 cleanupAfterManagedInjectFailure(
@@ -1893,7 +1938,8 @@ class FridaDeployer(private val appContext: Context) {
         client.executeShellCommand(
             "rm -f $REMOTE_FRIDA_SERVER $REMOTE_FRIDA_INJECT " +
                 "$REMOTE_HOOK_SCRIPT $REMOTE_DEPLOY_VERSION " +
-                "$REMOTE_BRIDGE_SOCKET $REMOTE_LAST_INJECT_MARKER $REMOTE_INJECTING_MARKER 2>/dev/null || true"
+                "$REMOTE_BRIDGE_SOCKET $REMOTE_STREAM_READY_MARKER " +
+                    "$REMOTE_LAST_INJECT_MARKER $REMOTE_INJECTING_MARKER 2>/dev/null || true"
         )
         log.onLog("  ✅ 已删除所有远端文件（含 frida-server/frida-inject 二进制及部署版本标记）")
 

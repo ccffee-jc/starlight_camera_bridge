@@ -74,7 +74,7 @@ class FridaDeployerPolicyTest {
     fun decideInjectEntry_skipsReadySocketOnlyWhenNotStrict() {
         val decision = decideInjectEntry(
             strictRestart = false,
-            bridgeSocketReady = true
+            bridgeReady = true
         )
 
         assertTrue(decision.shouldSkipBecauseSocketReady)
@@ -85,7 +85,7 @@ class FridaDeployerPolicyTest {
     fun decideInjectEntry_bypassesShortCircuitWhenStrictRestartEnabled() {
         val decision = decideInjectEntry(
             strictRestart = true,
-            bridgeSocketReady = true
+            bridgeReady = true
         )
 
         assertFalse(decision.shouldSkipBecauseSocketReady)
@@ -98,6 +98,7 @@ class FridaDeployerPolicyTest {
             lastInjectAtMs = 1_000L,
             nowMs = 10_000L,
             bridgeSocketReady = false,
+            bridgeStreamReady = false,
             lastInjectPid = "200",
             currentPid = "200"
         )
@@ -112,6 +113,7 @@ class FridaDeployerPolicyTest {
             lastInjectAtMs = 1_000L,
             nowMs = 10_000L,
             bridgeSocketReady = false,
+            bridgeStreamReady = false,
             lastInjectPid = "100",
             currentPid = "200"
         )
@@ -121,17 +123,33 @@ class FridaDeployerPolicyTest {
     }
 
     @Test
-    fun decideDuplicateInjection_shouldSkipOnlyWhenSocketReadyInsideWindow() {
+    fun decideDuplicateInjection_shouldSkipOnlyWhenBridgeReadyInsideWindow() {
         val decision = decideDuplicateInjection(
             lastInjectAtMs = 1_000L,
             nowMs = 10_000L,
             bridgeSocketReady = true,
+            bridgeStreamReady = true,
             lastInjectPid = "100",
             currentPid = "100"
         )
 
         assertTrue(decision.shouldSkip)
-        assertEquals("socket_ready", decision.reason)
+        assertEquals("bridge_ready", decision.reason)
+    }
+
+    @Test
+    fun decideDuplicateInjection_shouldForceWhenStreamNotReadyInsideWindow() {
+        val decision = decideDuplicateInjection(
+            lastInjectAtMs = 1_000L,
+            nowMs = 10_000L,
+            bridgeSocketReady = true,
+            bridgeStreamReady = false,
+            lastInjectPid = "100",
+            currentPid = "100"
+        )
+
+        assertFalse(decision.shouldSkip)
+        assertEquals("stream_not_ready", decision.reason)
     }
 
     @Test
@@ -230,6 +248,20 @@ class FridaDeployerPolicyTest {
         assertEquals("line1\nline2", result.output)
         assertEquals(7, result.exitCode)
         assertFalse(result.markerMissing)
+    }
+
+    @Test
+    fun parseBridgeReadinessState_extractsSocketAndStreamFlags() {
+        val state = parseBridgeReadinessState(
+            """
+            __BRIDGE_SOCKET__:1
+            __BRIDGE_STREAM__:0
+            """.trimIndent()
+        )
+
+        assertTrue(state.socketReady)
+        assertFalse(state.streamReady)
+        assertFalse(state.ready)
     }
 
     @Test
