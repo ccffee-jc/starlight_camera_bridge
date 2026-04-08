@@ -28,6 +28,8 @@ internal const val DUPLICATE_INJECT_SKIP_WINDOW_MS = 60000L
 internal const val DEFAULT_BRIDGE_TARGET_FPS = 15.0
 internal const val BUNDLED_FRIDA_BINARY_VERSION =
     "frida-server-17.6.2_frida-inject-17.4.0_android-arm64_disable-preload"
+internal const val BRIDGE_INJECT_SOURCE_MAX_LEN = 120
+internal const val BRIDGE_INJECT_SOURCE_UNKNOWN = "unknown"
 private const val MIN_BRIDGE_TARGET_FPS = 5.0
 private const val MAX_BRIDGE_TARGET_FPS = 30.0
 private const val HOOK_SCRIPT_TARGET_FPS_PLACEHOLDER = "__TARGET_FPS__"
@@ -54,6 +56,21 @@ private val HOOK_TARGET_FPS_FORMAT = DecimalFormat(
 internal fun normalizeBridgeTargetFps(targetFps: Double): Double {
     if (!targetFps.isFinite()) return DEFAULT_BRIDGE_TARGET_FPS
     return targetFps.coerceIn(MIN_BRIDGE_TARGET_FPS, MAX_BRIDGE_TARGET_FPS)
+}
+
+internal fun normalizeBridgeInjectSource(
+    raw: String?,
+    fallback: String = BRIDGE_INJECT_SOURCE_UNKNOWN
+): String {
+    val base = raw?.trim().takeUnless { it.isNullOrEmpty() } ?: fallback
+    val sanitized = buildString(base.length) {
+        for (ch in base) {
+            val keep = ch.isLetterOrDigit() || ch == '_' || ch == '-' || ch == ':' || ch == '.' || ch == '/'
+            append(if (keep) ch else '_')
+        }
+    }.take(BRIDGE_INJECT_SOURCE_MAX_LEN)
+    val trimmed = sanitized.trim('_')
+    return if (trimmed.isBlank()) fallback else trimmed
 }
 
 internal fun computeBridgeFrameIntervalMs(targetFps: Double): Int {
@@ -828,6 +845,12 @@ class FridaDeployer(private val appContext: Context) {
         }
     }
 
+    private suspend fun appendInjectSourceLog(client: AdbClient, source: String) {
+        val timestampMs = System.currentTimeMillis()
+        val line = "==== inject_source ts=$timestampMs source=$source ===="
+        client.executeShellCommand("printf '%s\\n' ${shellQuote(line)} >> $REMOTE_FRIDA_INJECT_LOG")
+    }
+
     private suspend fun readInjectLogWindow(
         client: AdbClient,
         startMarker: String,
@@ -1506,7 +1529,8 @@ class FridaDeployer(private val appContext: Context) {
         port: Int,
         log: LogCallback,
         strictRestart: Boolean = false,
-        targetFps: Double = DEFAULT_BRIDGE_TARGET_FPS
+        targetFps: Double = DEFAULT_BRIDGE_TARGET_FPS,
+        injectSource: String? = null
     ) {
         if (!injectOperationRunning.compareAndSet(false, true)) {
             log.onLog("⚠️ 已有注入流程执行中（含目标进程轮询），跳过重复注入请求")
@@ -1521,6 +1545,7 @@ class FridaDeployer(private val appContext: Context) {
         val normalizedTargetFps = normalizeBridgeTargetFps(targetFps)
         val formattedTargetFps = formatBridgeTargetFps(normalizedTargetFps)
         val minIntervalMs = computeBridgeFrameIntervalMs(normalizedTargetFps)
+        val normalizedInjectSource = normalizeBridgeInjectSource(injectSource)
         try {
             // 1. 连接
             log.onLog("⏳ 连接 ADB ($host:$port)...")
@@ -1528,6 +1553,12 @@ class FridaDeployer(private val appContext: Context) {
             log.onLog("✅ ADB 已连接")
             log.onLog("🎯 本次 bridge 采集节流 targetFps=$formattedTargetFps minIntervalMs=$minIntervalMs")
             log.onLog("🧩 内置 Frida 二进制版本=$BUNDLED_FRIDA_BINARY_VERSION")
+            log.onLog("🧭 注入来源 source=$normalizedInjectSource")
+            runCatching {
+                appendInjectSourceLog(client, normalizedInjectSource)
+            }.onFailure { error ->
+                log.onLog("⚠️ inject_source_log_failed err=${error.message}")
+            }
             markInjectingInProgress(client)
             log.onLog("ℹ️ 已写入注入中标记")
 

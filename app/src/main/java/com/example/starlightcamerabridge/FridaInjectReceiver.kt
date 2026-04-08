@@ -26,6 +26,7 @@ class FridaInjectReceiver : BroadcastReceiver() {
         const val ACTION_RESTORE = "com.example.starlightcamerabridge.ACTION_RESTORE"
         const val EXTRA_STRICT_RESTART = "strict_restart"
         const val EXTRA_TARGET_FPS = "target_fps"
+        const val EXTRA_INJECT_SOURCE = "inject_source"
         private const val INVALID_TARGET_FPS = Double.NaN
         private val operationRunning = AtomicBoolean(false)
     }
@@ -48,10 +49,11 @@ class FridaInjectReceiver : BroadcastReceiver() {
         val port = intent.getStringExtra("port")?.toIntOrNull()
             ?: AdbConnectionPreferences.getPort(appContext)
         val strictRestart = intent.getBooleanExtra(EXTRA_STRICT_RESTART, false)
+        val injectSource = intent.getStringExtra(EXTRA_INJECT_SOURCE)
         val targetFps = resolveTargetFps(intent, appContext)
         BridgeTargetFpsPreferences.save(appContext, targetFps)
 
-        Log.i(TAG, "使用连接: $host:$port strictRestart=$strictRestart targetFps=$targetFps")
+        Log.i(TAG, "使用连接: $host:$port strictRestart=$strictRestart targetFps=$targetFps source=$injectSource")
 
         val deployer = FridaDeployer(appContext)
         val logCallback = FridaDeployer.LogCallback { msg ->
@@ -72,7 +74,8 @@ class FridaInjectReceiver : BroadcastReceiver() {
                             port = port,
                             log = logCallback,
                             strictRestart = strictRestart,
-                            targetFps = targetFps
+                            targetFps = targetFps,
+                            injectSource = injectSource
                         )
                     } finally {
                         operationRunning.set(false)

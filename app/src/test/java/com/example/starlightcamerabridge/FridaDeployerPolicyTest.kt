@@ -26,6 +26,16 @@ class FridaDeployerPolicyTest {
     }
 
     @Test
+    fun normalizeBridgeInjectSource_shouldSanitizeAndFallback() {
+        assertEquals("ui_action/aa_bb", normalizeBridgeInjectSource(" ui action/aa?bb "))
+
+        val longRaw = "x".repeat(BRIDGE_INJECT_SOURCE_MAX_LEN + 5)
+        assertEquals(BRIDGE_INJECT_SOURCE_MAX_LEN, normalizeBridgeInjectSource(longRaw).length)
+
+        assertEquals("fallback", normalizeBridgeInjectSource("!!!", fallback = "fallback"))
+    }
+
+    @Test
     fun shouldRestartInnerAvmProcess_requiresPidUnchanged() {
         assertFalse(shouldRestartInnerAvmProcess(previousPid = null, currentPid = "123"))
         assertFalse(shouldRestartInnerAvmProcess(previousPid = "100", currentPid = null))
