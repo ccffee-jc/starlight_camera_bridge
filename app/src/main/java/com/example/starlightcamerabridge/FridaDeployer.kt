@@ -724,6 +724,20 @@ class FridaDeployer(private val appContext: Context) {
         return "'" + path.replace("'", "'\\''") + "'"
     }
 
+    private fun shellEscapeForDoubleQuotes(raw: String): String {
+        return buildString(raw.length) {
+            for (ch in raw) {
+                when (ch) {
+                    '\\' -> append("\\\\")
+                    '"' -> append("\\\"")
+                    '$' -> append("\\$")
+                    '`' -> append("\\`")
+                    else -> append(ch)
+                }
+            }
+        }
+    }
+
     /**
      * 获取远程文件的 MD5 值。
      *
@@ -848,7 +862,8 @@ class FridaDeployer(private val appContext: Context) {
     private suspend fun appendInjectSourceLog(client: AdbClient, source: String) {
         val timestampMs = System.currentTimeMillis()
         val line = "==== inject_source ts=$timestampMs source=$source ===="
-        client.executeShellCommand("printf '%s\\n' ${shellQuote(line)} >> $REMOTE_FRIDA_INJECT_LOG")
+        val escaped = shellEscapeForDoubleQuotes(line)
+        client.executeShellCommand("printf \"%s\\\\n\" \"$escaped\" >> $REMOTE_FRIDA_INJECT_LOG")
     }
 
     private suspend fun readInjectLogWindow(
