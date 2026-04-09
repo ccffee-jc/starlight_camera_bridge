@@ -108,7 +108,7 @@ class FridaDeployerPolicyTest {
             lastInjectAtMs = 1_000L,
             nowMs = 10_000L,
             bridgeSocketReady = false,
-            bridgeStreamReady = false,
+            bridgeProtocolReady = false,
             lastInjectPid = "200",
             currentPid = "200"
         )
@@ -123,7 +123,7 @@ class FridaDeployerPolicyTest {
             lastInjectAtMs = 1_000L,
             nowMs = 10_000L,
             bridgeSocketReady = false,
-            bridgeStreamReady = false,
+            bridgeProtocolReady = false,
             lastInjectPid = "100",
             currentPid = "200"
         )
@@ -138,7 +138,7 @@ class FridaDeployerPolicyTest {
             lastInjectAtMs = 1_000L,
             nowMs = 10_000L,
             bridgeSocketReady = true,
-            bridgeStreamReady = true,
+            bridgeProtocolReady = true,
             lastInjectPid = "100",
             currentPid = "100"
         )
@@ -148,18 +148,18 @@ class FridaDeployerPolicyTest {
     }
 
     @Test
-    fun decideDuplicateInjection_shouldForceWhenStreamNotReadyInsideWindow() {
+    fun decideDuplicateInjection_shouldForceWhenProtocolNotReadyInsideWindow() {
         val decision = decideDuplicateInjection(
             lastInjectAtMs = 1_000L,
             nowMs = 10_000L,
             bridgeSocketReady = true,
-            bridgeStreamReady = false,
+            bridgeProtocolReady = false,
             lastInjectPid = "100",
             currentPid = "100"
         )
 
         assertFalse(decision.shouldSkip)
-        assertEquals("stream_not_ready", decision.reason)
+        assertEquals("proto_not_ready", decision.reason)
     }
 
     @Test
@@ -261,16 +261,30 @@ class FridaDeployerPolicyTest {
     }
 
     @Test
-    fun parseBridgeReadinessState_extractsSocketAndStreamFlags() {
+    fun parseBridgeReadinessState_extractsProtocolReady() {
         val state = parseBridgeReadinessState(
             """
             __BRIDGE_SOCKET__:1
-            __BRIDGE_STREAM__:0
+            __BRIDGE_PROTO__:1
             """.trimIndent()
         )
 
         assertTrue(state.socketReady)
-        assertFalse(state.streamReady)
+        assertTrue(state.protocolReady)
+        assertTrue(state.ready)
+    }
+
+    @Test
+    fun parseBridgeReadinessState_extractsSocketAndProtocolFlags() {
+        val state = parseBridgeReadinessState(
+            """
+            __BRIDGE_SOCKET__:1
+            __BRIDGE_PROTO__:0
+            """.trimIndent()
+        )
+
+        assertTrue(state.socketReady)
+        assertFalse(state.protocolReady)
         assertFalse(state.ready)
     }
 

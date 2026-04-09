@@ -48,6 +48,11 @@ Process.setExceptionHandler(function(details) {
 var MODE_FOREGROUND = 0;
 var MODE_BACKGROUND_BRIDGE = 1;
 var MODE_RECOVERING = 2;
+var PROTO_HELLO = 0xE1;
+var PROTO_EVENT_HELLO_ACK = 0xF1;
+var PROTO_EVENT_FIRST_FRAME_ACK = 0xF2;
+var PROTO_EVENT_STABLE = 0xF3;
+var PROTO_EVENT_DEGRADED = 0xF4;
 
 var BACKGROUND_BYPASS_COPY = __BACKGROUND_BYPASS_COPY__;
 var BACKGROUND_BYPASS_RENDER = __BACKGROUND_BYPASS_RENDER__;
@@ -213,8 +218,8 @@ function ensureSocketNF() {
 
 // ==================== STATE ====================
 var SOCK_PATH = "/data/local/tmp/starlight_bridge.sock";
-var STREAM_READY_MARKER_PATH = "/data/local/tmp/starlight_bridge_stream_ready";
-var STREAM_READY_MIN_SENT_FRAMES = 3;
+var PROTO_READY_MARKER_PATH = "/data/local/tmp/starlight_bridge_proto_v2_ready";
+var PROTO_STABLE_MIN_SENT_FRAMES = 3;
 var maxFrames = 4;
 var planeLenY = 0, planeLenU = 0, planeLenV = 0, frameSlotSize = 0;
 var ringReady = false;
@@ -222,7 +227,10 @@ var _memfd_fds = [], _memfd_addrs = [];
 var _serverFd = -1, _clientFd = -1;
 var clientReady = false; // handshake 完成
 var clientSentSinceHandshake = 0;
-var streamReadyMarked = false;
+var protoReadyMarked = false;
+var protoV2Enabled = false;
+var protoFirstFrameSent = false;
+var protoStableSent = false;
 var frameWidth = 0, frameHeight = 0, frameFmt = 0;
 var wireWidth = 0, wireHeight = 0;
 var frameCount = 0, skippedCount = 0, sentCount = 0;
@@ -232,32 +240,37 @@ var FORCE_OUTPUT_RES = false;
 var OUTPUT_WIDTH = 2560;
 var OUTPUT_HEIGHT = 1920;
 
-function clearStreamReadyMarker(reason) {
-    _unlink_raw(Memory.allocUtf8String(STREAM_READY_MARKER_PATH));
-    if (streamReadyMarked) {
-        log("[*] stream_ready marker cleared" + (reason ? " reason=" + reason : ""));
+function clearProtoReadyMarker(reason) {
+    _unlink_raw(Memory.allocUtf8String(PROTO_READY_MARKER_PATH));
+    if (protoReadyMarked) {
+        log("[*] proto_ready marker cleared" + (reason ? " reason=" + reason : ""));
     }
-    streamReadyMarked = false;
-    clientSentSinceHandshake = 0;
+    protoReadyMarked = false;
 }
 
-function writeStreamReadyMarker() {
-    if (streamReadyMarked) return;
-    var fd = _open(Memory.allocUtf8String(STREAM_READY_MARKER_PATH), 0x241, 0x1b6);
+function writeProtoReadyMarker() {
+    if (protoReadyMarked) return;
+    var fd = _open(Memory.allocUtf8String(PROTO_READY_MARKER_PATH), 0x241, 0x1b6);
     if (fd < 0) {
-        log("[!] stream_ready marker open fail");
+        log("[!] proto_ready marker open fail");
         return;
     }
     var payload = Memory.allocUtf8String(String(Date.now()));
     _write_raw(fd, payload, _strlen(payload));
     _close(fd);
-    streamReadyMarked = true;
-    log("[✓] stream_ready marker: " + STREAM_READY_MARKER_PATH +
-        " sent_since_handshake=" + clientSentSinceHandshake +
-        " total_sent=" + sentCount);
+    protoReadyMarked = true;
+    log("[✓] proto_ready marker: " + PROTO_READY_MARKER_PATH);
 }
 
-clearStreamReadyMarker("script_init");
+function resetProtocolState(reason) {
+    protoV2Enabled = false;
+    protoFirstFrameSent = false;
+    protoStableSent = false;
+    clientSentSinceHandshake = 0;
+    clearProtoReadyMarker(reason);
+}
+
+resetProtocolState("script_init");
 
 function resolveWireDimensions(srcW, srcH) {
     if (!FORCE_OUTPUT_RES) return [srcW, srcH];
@@ -354,8 +367,61 @@ function doHandshake() {
     if (flags2 >= 0) _nfFcntl(_clientFd, 4, flags2 | 0x800);
 
     clientReady = true;
-    clientSentSinceHandshake = 0;
+    resetProtocolState("handshake_complete");
     log("[✓] handshake complete! client ready for frames");
+}
+
+function sendProtocolEvent(code, label) {
+    if (!protoV2Enabled || _clientFd < 0) return false;
+    _idxBuf.writeU8(code);
+    var sn = _nfSend(_clientFd, _idxBuf, 1, MSG_DONTWAIT | MSG_NOSIGNAL);
+    if (sn === 1) {
+        if (label) log("[*] proto_event sent " + label + " code=0x" + code.toString(16));
+        return true;
+    }
+    log("[!] proto_event send failed code=0x" + code.toString(16));
+    return false;
+}
+
+function handleClientControlByte(code) {
+    if (code === PROTO_HELLO) {
+        if (!protoV2Enabled) {
+            protoV2Enabled = true;
+            log("[*] proto hello received, enable v2 events");
+        }
+        sendProtocolEvent(PROTO_EVENT_HELLO_ACK, "hello_ack");
+        if (clientSentSinceHandshake > 0 && !protoFirstFrameSent) {
+            if (sendProtocolEvent(PROTO_EVENT_FIRST_FRAME_ACK, "first_frame_ack_sync")) {
+                protoFirstFrameSent = true;
+            }
+        }
+        if (clientSentSinceHandshake >= PROTO_STABLE_MIN_SENT_FRAMES && !protoStableSent) {
+            if (sendProtocolEvent(PROTO_EVENT_STABLE, "stable_sync")) {
+                protoStableSent = true;
+                writeProtoReadyMarker();
+            }
+        }
+        return;
+    }
+    // 其余控制信号（release/兼容信号）无需处理
+}
+
+function drainClientSignals() {
+    if (!clientReady || _clientFd < 0) return;
+    var total = 0;
+    for (var i = 0; i < 4; i++) {
+        var nr = _nfRecv(_clientFd, _drainBuf, 16, MSG_DONTWAIT);
+        if (nr <= 0) break;
+        total += nr;
+        for (var j = 0; j < nr; j++) {
+            var code = _drainBuf.add(j).readU8();
+            handleClientControlByte(code);
+        }
+        if (nr < 16) break;
+    }
+    if (total > 0 && total % 16 === 0) {
+        log("[*] proto drain bytes=" + total);
+    }
 }
 
 // 通过 SCM_RIGHTS 发送单个 fd
@@ -700,22 +766,32 @@ Interceptor.attach(ex["AImageReader_acquireLatestImage"], {
                 if (sn === 1) {
                     sentCount++;
                     clientSentSinceHandshake++;
-                    if (!streamReadyMarked && clientSentSinceHandshake >= STREAM_READY_MIN_SENT_FRAMES) {
-                        writeStreamReadyMarker();
+                    if (protoV2Enabled && !protoFirstFrameSent) {
+                        if (sendProtocolEvent(PROTO_EVENT_FIRST_FRAME_ACK, "first_frame_ack")) {
+                            protoFirstFrameSent = true;
+                        }
+                    }
+                    if (protoV2Enabled && !protoStableSent &&
+                        clientSentSinceHandshake >= PROTO_STABLE_MIN_SENT_FRAMES) {
+                        if (sendProtocolEvent(PROTO_EVENT_STABLE, "stable")) {
+                            protoStableSent = true;
+                            writeProtoReadyMarker();
+                        }
                     }
                 } else {
                     // 客户端可能断开
+                    sendProtocolEvent(PROTO_EVENT_DEGRADED, "degraded");
                     clientReady = false;
                     _close(_clientFd);
                     _clientFd = -1;
-                    clearStreamReadyMarker("client_disconnect");
+                    resetProtocolState("client_disconnect");
                     log("[!] client disconnected (send fail)");
                 }
             }
 
             // drain release signals (non-blocking read)
             if (clientReady && _clientFd >= 0) {
-                _nfRecv(_clientFd, _drainBuf, 16, MSG_DONTWAIT);
+                drainClientSignals();
             }
 
             if (now - lastLogTs >= 5000) {
