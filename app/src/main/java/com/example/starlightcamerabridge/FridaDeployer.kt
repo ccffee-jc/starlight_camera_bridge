@@ -1906,8 +1906,11 @@ class FridaDeployer(private val appContext: Context) {
                     syncLastInjectMarker(client, injectAtMs)
                     log.onLog("🕒 已写入本次注入时间标记")
                 } else {
-                    retainInjectingMarker = true
-                    log.onLog("⚠️ bridge 仍未就绪（socket + proto_ready 未同时满足），跳过收口并暂不写入注入时间标记，允许哨兵快速重试")
+                    runCatching { clearInjectingInProgressMarker(client) }
+                        .onFailure { error ->
+                            log.onLog("⚠️ bridge 未就绪且清理 injecting marker 失败 err=${error.message}")
+                        }
+                    log.onLog("⚠️ bridge 仍未就绪（socket + proto_ready 未同时满足），已清理 injecting marker，允许严格重启重试")
                 }
             } else {
                 cleanupAfterManagedInjectFailure(

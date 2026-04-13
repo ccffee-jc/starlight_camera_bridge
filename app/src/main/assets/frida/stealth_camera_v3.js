@@ -239,6 +239,11 @@ var targetFps = __TARGET_FPS__, minIntervalMs = __MIN_INTERVAL_MS__;
 var FORCE_OUTPUT_RES = false;
 var OUTPUT_WIDTH = 2560;
 var OUTPUT_HEIGHT = 1920;
+var HANDSHAKE_BACKOFF_BASE_MS = 800;
+var HANDSHAKE_BACKOFF_MAX_MS = 8000;
+var handshakeBackoffMs = 0;
+var nextHandshakeAllowedAt = 0;
+var lastHandshakeBackoffLogAt = 0;
 
 function clearProtoReadyMarker(reason) {
     _unlink_raw(Memory.allocUtf8String(PROTO_READY_MARKER_PATH));
@@ -271,6 +276,25 @@ function resetProtocolState(reason) {
 }
 
 resetProtocolState("script_init");
+
+function resetHandshakeBackoff(reason) {
+    if (handshakeBackoffMs > 0) {
+        log("[*] handshake backoff cleared" + (reason ? " reason=" + reason : ""));
+    }
+    handshakeBackoffMs = 0;
+    nextHandshakeAllowedAt = 0;
+    lastHandshakeBackoffLogAt = 0;
+}
+
+function noteHandshakeFailure(reason) {
+    var now = Date.now();
+    handshakeBackoffMs = handshakeBackoffMs > 0
+        ? Math.min(handshakeBackoffMs * 2, HANDSHAKE_BACKOFF_MAX_MS)
+        : HANDSHAKE_BACKOFF_BASE_MS;
+    nextHandshakeAllowedAt = now + handshakeBackoffMs;
+    lastHandshakeBackoffLogAt = now;
+    log("[!] handshake backoff set wait=" + handshakeBackoffMs + "ms" + (reason ? " reason=" + reason : ""));
+}
 
 function resolveWireDimensions(srcW, srcH) {
     if (!FORCE_OUTPUT_RES) return [srcW, srcH];
@@ -315,6 +339,17 @@ function tryAcceptClient() {
     _clientFd = fd;
     log("[✓] client accepted: fd=" + fd);
 
+    var now = Date.now();
+    if (nextHandshakeAllowedAt > 0 && now < nextHandshakeAllowedAt) {
+        var waitMs = nextHandshakeAllowedAt - now;
+        if (now - lastHandshakeBackoffLogAt >= 1000) {
+            lastHandshakeBackoffLogAt = now;
+            log("[!] handshake backoff active wait=" + waitMs + "ms");
+        }
+        _close(_clientFd); _clientFd = -1;
+        return;
+    }
+
     // 客户端 fd 设为阻塞 + 超时
     var flags = _nfFcntl(_clientFd, 3, 0);
     if (flags >= 0) _nfFcntl(_clientFd, 4, flags & ~0x800); // 清除 O_NONBLOCK
@@ -339,6 +374,8 @@ function doHandshake() {
     var n = _nfSend(_clientFd, header, 24, 0);
     if (n !== 24) {
         log("[!] handshake: send metadata fail (" + n + ")");
+        noteHandshakeFailure("send_metadata_fail");
+        resetProtocolState("handshake_metadata_fail");
         _close(_clientFd); _clientFd = -1; return;
     }
     log("[*] handshake: metadata sent (wire=" + wireWidth + "x" + wireHeight +
@@ -349,6 +386,8 @@ function doHandshake() {
     for (var i = 0; i < maxFrames; i++) {
         if (!sendFdViaSCM(_clientFd, _memfd_fds[i])) {
             log("[!] handshake: sendFd[" + i + "] fail");
+            noteHandshakeFailure("send_fd_fail");
+            resetProtocolState("handshake_fd_fail");
             _close(_clientFd); _clientFd = -1; return;
         }
     }
@@ -359,6 +398,8 @@ function doHandshake() {
     var nr = _nfRecv(_clientFd, ackBuf, 1, 0);
     if (nr !== 1 || ackBuf.readU8() !== 0x01) {
         log("[!] handshake: ACK fail (nr=" + nr + ")");
+        noteHandshakeFailure("ack_fail");
+        resetProtocolState("handshake_ack_fail");
         _close(_clientFd); _clientFd = -1; return;
     }
 
@@ -368,6 +409,7 @@ function doHandshake() {
 
     clientReady = true;
     resetProtocolState("handshake_complete");
+    resetHandshakeBackoff("handshake_complete");
     log("[✓] handshake complete! client ready for frames");
 }
 
